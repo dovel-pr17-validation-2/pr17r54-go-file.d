@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags: ["", "-race"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          GOFLAGS: ${{ matrix.flags }}
+          LOG_LEVEL: error
+        run: |
+          go test -coverprofile=profile${{ matrix.flags }}.out -covermode=atomic -v -coverpkg=./... ./... -json | tee test-report${{ matrix.flags }}.json
+
+      - name: Coverage report
+        run: |
+          if [ -f profile${{ matrix.flags }}.out ]; then
+            go tool cover -html=profile${{ matrix.flags }}.out -o coverage${{ matrix.flags }}.html
+          else
+            echo "No coverage data generated for ${{ matrix.flags }} tests" > coverage${{ matrix.flags }}.html
+          fi
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts${{ matrix.flags || '-standard' }}
+          path: |
+            profile${{ matrix.flags }}.out
+            test-report${{ matrix.flags }}.json
+            coverage${{ matrix.flags }}.html
+          retention-days: 1
+
+      - name: Publish Test Report
+        uses: dorny/test-reporter@v2
+        if: always()
+        with:
+          name: Test Results
+          path: test-report${{ matrix.flags }}.json
+          reporter: golang-json
+          fail-on-error: true
+          list-suites: none
+          list-tests: failed
+
+      - name: Run benchmarks
+        if: ${{ !contains(matrix.flags, '-race') }}
+        env:
+          LOG_LEVEL: error
+        run: |
+          echo "### Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          go test --timeout=15m --benchtime=3x --benchmem --bench="BenchmarkLightJsonReadPar" --run=$^ ./plugin/input/file/... | tee benchmark.out
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat benchmark.out >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  e2e_test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags: ["", "-race"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run docker containers
+        run: make test-e2e-docker-up
+
+      - name: E2E
+        env:
+          GOFLAGS: ${{ matrix.flags }}
+          LOG_LEVEL: error
+        run: |
+          go test ./e2e -coverprofile=profile-e2e${{ matrix.flags }}.out -covermode=atomic -tags=e2e_new -timeout=3m -coverpkg=./... -json | tee test-report-e2e${{ matrix.flags }}.json
+
+      - name: Coverage report
+        run: |
+          if [ -f profile-e2e${{ matrix.flags }}.out ]; then
+            go tool cover -html=profile-e2e${{ matrix.flags }}.out -o coverage-e2e${{ matrix.flags }}.html
+          else
+            echo "No coverage data generated for ${{ matrix.flags }} tests" > coverage-e2e${{ matrix.flags }}.html
+          fi
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-e2e${{ matrix.flags }}
+          path: |
+            profile-e2e${{ matrix.flags }}.out
+            test-report-e2e${{ matrix.flags }}.json
+            coverage-e2e${{ matrix.flags }}.html
+          retention-days: 1
+
+      - name: Publish Test Report
+        uses: dorny/test-reporter@v2
+        if: always()
+        with:
+          name: Test Results
+          path: test-report-e2e${{ matrix.flags }}.json
+          reporter: golang-json
+          fail-on-error: true
+          list-suites: none
+          list-tests: failed
+
+  upload:
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - e2e_test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage*
+          merge-multiple: true
+
+      - name: Send coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: profile.out, profile-race.out, profile-e2e.out, profile-e2e-race.out,
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.8.0
+          only-new-issues: false
+          args: --timeout 5m
+          skip-cache: true
+          skip-save-cache: true
+
+  check-generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate doc
+        run: make gen-doc
+
+      - name: Generate mocks
+        run: make mock
+
+      - name: Go generate
+        run: go generate ./...
+
+      - name: Check git diff
+        run: git diff --exit-code
+
+  check-mod:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download && go mod tidy
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check git diff
+        run: git diff --exit-code

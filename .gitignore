@@ -1,0 +1,12 @@
+/file.d
+*.pprof
+*.test
+ozon*
+dist/
+tests-offsets
+testdata
+
+.idea/
+.vscode
+.DS_Store
+.zed

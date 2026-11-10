@@ -1,0 +1,1099 @@
+package cfg
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func NewTestConfig(names []string) *Config {
+	configFiles := make([]string, 0, len(names))
+	for _, name := range names {
+		configFiles = append(configFiles, "../testdata/config/"+name)
+	}
+	return NewConfigFromFiles(configFiles)
+}
+
+func TestSimple(t *testing.T) {
+	c := NewTestConfig([]string{"e2e.yaml", "e2e.override.yaml"})
+
+	assert.NotNil(t, c, "config loading should't return nil")
+	assert.Equal(t, 1, len(c.Pipelines), "pipelines count isn't match")
+
+	// check override config
+	outputType, err := c.Pipelines["test"].Raw.Get("output").Get("type").String()
+	assert.Nil(t, err, "cannot get output type")
+	assert.Equal(t, "devnull", outputType, "output type is not overrided")
+}
+
+type strRequired struct {
+	T string `required:"true"`
+}
+
+type PersistenceMode byte
+
+const (
+	PersistenceModeAsync PersistenceMode = iota
+	PersistenceModeSync
+)
+
+type strOptions struct {
+	T  string `default:"async" options:"async|sync"`
+	T_ PersistenceMode
+}
+
+type strExpression struct {
+	T  string `parse:"expression"`
+	T_ int
+}
+
+type strDataUnit struct {
+	T  string `parse:"data_unit"`
+	T_ uint
+}
+
+type hierarchyChild struct {
+	T string `required:"true"`
+}
+
+type hierarchy struct {
+	T     string         `default:"sync"`
+	Child hierarchyChild `child:"true"`
+}
+
+type sliceChild struct {
+	Value string `default:"child"`
+}
+
+func (s *sliceChild) UnmarshalJSON(raw []byte) error {
+	SetDefaultValues(s)
+	var childPtr struct {
+		Value *string
+	}
+
+	if err := json.Unmarshal(raw, &childPtr); err != nil {
+		return err
+	}
+
+	if childPtr.Value != nil {
+		s.Value = *childPtr.Value
+	}
+
+	return nil
+}
+
+type sliceStruct struct {
+	Value  string       `default:"parent"`
+	Childs []sliceChild `default:"" slice:"true"`
+}
+
+type strBase8 struct {
+	T  string `default:"0666" parse:"base8"`
+	T_ int64
+}
+
+func TestParseRequiredOk(t *testing.T) {
+	s := &strRequired{T: "some_value"}
+	err := Parse(s, nil)
+
+	assert.NoError(t, err, "shouldn't be an error")
+}
+
+func TestParseRequiredErr(t *testing.T) {
+	s := &strRequired{}
+	err := Parse(s, nil)
+
+	assert.NotNil(t, err, "should be an error")
+}
+
+func TestParseDefault(t *testing.T) {
+	s := &struct {
+		S string `default:"sync"`
+	}{}
+	SetDefaultValues(s)
+	err := Parse(s, nil)
+
+	assert.NoError(t, err, "shouldn't be an error")
+	assert.Equal(t, "sync", s.S, "wrong value")
+}
+
+func TestParseDuration(t *testing.T) {
+	t.Parallel()
+	r := require.New(t)
+
+	t.Run("with_default", func(t *testing.T) {
+		t.Parallel()
+
+		s := &struct {
+			T  Duration `default:"5s" parse:"duration"`
+			T_ time.Duration
+		}{}
+		SetDefaultValues(s)
+		r.NoError(Parse(s, nil))
+		r.Equal(time.Second*5, s.T_)
+	})
+
+	t.Run("without_default", func(t *testing.T) {
+		t.Parallel()
+
+		s := &struct {
+			T  Duration `parse:"duration"`
+			T_ time.Duration
+		}{}
+		SetDefaultValues(s)
+		r.NoError(Parse(s, nil))
+		r.Equal(time.Duration(0), s.T_)
+	})
+}
+
+func TestParseOptionsOk(t *testing.T) {
+	a := assert.New(t)
+
+	s := &strOptions{T: "async"}
+	a.NoError(Parse(s, nil))
+	a.Equal(s.T_, PersistenceModeAsync)
+
+	s.T = "sync"
+	a.NoError(Parse(s, nil))
+	a.Equal(s.T_, PersistenceModeSync)
+}
+
+func TestParseOptionsErr(t *testing.T) {
+	s := &strOptions{T: "sequential"}
+	err := Parse(s, nil)
+
+	assert.NotNil(t, err, "should be an error")
+	assert.Equal(t, PersistenceMode(0), s.T_)
+}
+
+func TestParseExpressionMul(t *testing.T) {
+	s := &strExpression{T: "val*2"}
+	err := Parse(s, map[string]int{"val": 3})
+
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, 6, s.T_, "wrong value")
+}
+
+func TestParseExpressionAdd(t *testing.T) {
+	s := &strExpression{T: "10+val"}
+	err := Parse(s, map[string]int{"val": 3})
+
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, 13, s.T_, "wrong value")
+}
+
+func TestParseExpressionConst(t *testing.T) {
+	s := &strExpression{T: "10"}
+	err := Parse(s, map[string]int{"val": 12})
+
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, 10, s.T_, "wrong value")
+}
+
+func TestParseDataUnitInvalid(t *testing.T) {
+	TestList := []struct {
+		strDataUnit   *strDataUnit
+		ExpectedError error
+		ExpectedValue uint
+	}{
+		{
+			strDataUnit:   &strDataUnit{T: "10"},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: " 10"},
+			ExpectedError: errors.New(`can't parse uint: "" is not a number`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "10 "},
+			ExpectedError: errors.New(`unexpected alias ""`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: " 1 MB"},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: " MB"},
+			ExpectedError: errors.New(`can't parse uint: "" is not a number`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "MB "},
+			ExpectedError: errors.New(`can't parse uint: "MB" is not a number`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "10 "},
+			ExpectedError: errors.New(`unexpected alias ""`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "something"},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "some thing"},
+			ExpectedError: errors.New(`can't parse uint: "some" is not a number`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: ""},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "999999999999999999999 B"},
+			ExpectedError: errors.New(`can't parse uint: "999999999999999999999" is not a number`),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "1  B"},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "1 B "},
+			ExpectedError: errors.New("invalid data format, the string must contain 2 parts separated by a space"),
+			ExpectedValue: 0,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "-1 PB"},
+			ExpectedError: errors.New("value must be positive"),
+			ExpectedValue: 0,
+		},
+		// TODO: handle uint overflow situation
+		// {
+		//	strDataUnit:       &strDataUnit{T: "100000000000 PB"},
+		//	ExpectedError: errors.New("uint overflowed on product 100000000000 and PB"),
+		//	ExpectedValue: 0,
+		// },
+	}
+	for i := range TestList {
+		err := Parse(TestList[i].strDataUnit, nil)
+		assert.Equal(t, TestList[i].ExpectedError, err, "wrong error")
+		assert.Equal(t, uint(0), TestList[i].strDataUnit.T_, "wrong value")
+	}
+}
+
+func TestParseDataUnitValid(t *testing.T) {
+	TestList := []struct {
+		strDataUnit   *strDataUnit
+		ExpectedValue uint
+	}{
+		{
+			strDataUnit:   &strDataUnit{T: "10 MB"},
+			ExpectedValue: 10000000,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "10 mB"},
+			ExpectedValue: 10000000,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "10 Mb"},
+			ExpectedValue: 10000000,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "10 mb"},
+			ExpectedValue: 10000000,
+		},
+		{
+			strDataUnit:   &strDataUnit{T: "1 B"},
+			ExpectedValue: 1,
+		},
+	}
+	for i := range TestList {
+		err := Parse(TestList[i].strDataUnit, nil)
+		assert.Nil(t, err, "shouldn't be an error")
+		assert.Equal(t, TestList[i].ExpectedValue, TestList[i].strDataUnit.T_, "wrong value")
+	}
+}
+
+func TestParseFieldSelectorSimple(t *testing.T) {
+	path := ParseFieldSelector("a.b.c")
+
+	assert.Equal(t, 3, len(path), "wrong length")
+	assert.Equal(t, "a", path[0], "wrong field")
+	assert.Equal(t, "b", path[1], "wrong field")
+	assert.Equal(t, "c", path[2], "wrong field")
+}
+
+func TestParseFieldSelectorEscape(t *testing.T) {
+	path := ParseFieldSelector("a.b..c")
+
+	assert.Equal(t, 2, len(path), "wrong length")
+	assert.Equal(t, "a", path[0], "wrong field")
+	assert.Equal(t, "b.c", path[1], "wrong field")
+}
+
+func TestParseFieldSelectorEnding(t *testing.T) {
+	path := ParseFieldSelector("a.b.c..")
+
+	assert.Equal(t, 3, len(path), "wrong length")
+	assert.Equal(t, "a", path[0], "wrong field")
+	assert.Equal(t, "b", path[1], "wrong field")
+	assert.Equal(t, "c.", path[2], "wrong field")
+}
+
+func TestParseNestedFields(t *testing.T) {
+	type TestCase struct {
+		fields []string
+		paths  [][]string
+		errMsg string
+	}
+
+	for _, tt := range []TestCase{
+		{
+			// simple
+			fields: []string{"a", "b", "c"},
+			paths:  [][]string{{"a"}, {"b"}, {"c"}},
+		},
+		{
+			fields: []string{},
+			errMsg: "empty fields list",
+		},
+		{
+			fields: []string{"a", "b", ""},
+			errMsg: "empty path parsed",
+		},
+		{
+			// simple duplicates
+			fields: []string{"a", "b", "b", "a", "c", "a", "c", "b"},
+			paths:  [][]string{{"a"}, {"b"}, {"c"}},
+		},
+		{
+			// nested duplicates
+			fields: []string{"a.b", "some.qwe", "some.qwe", "a.b"},
+			paths:  [][]string{{"a", "b"}, {"some", "qwe"}},
+		},
+		{
+			// nested duplicates and nested field
+			fields: []string{"a.b.c", "a.b", "a.b"},
+			paths:  [][]string{{"a", "b"}},
+		},
+		{
+			// field name prefix
+			fields: []string{"prefix", "prefix_some"},
+			paths:  [][]string{{"prefix"}, {"prefix_some"}},
+		},
+		{
+			// nested field name prefix
+			fields: []string{"qwe12.some.f1", "qwe"},
+			paths:  [][]string{{"qwe"}, {"qwe12", "some", "f1"}},
+		},
+		{
+			// nested field name prefix
+			fields: []string{"qwe.some12.f1", "qwe.some"},
+			paths:  [][]string{{"qwe", "some"}, {"qwe", "some12", "f1"}},
+		},
+		{
+			// many nested fields
+			fields: []string{"a.b", "a.b.c", "a.d", "a"},
+			paths:  [][]string{{"a"}},
+		},
+		{
+			fields: []string{"a.b.f1", "a.b.f2"},
+			paths:  [][]string{{"a", "b", "f1"}, {"a", "b", "f2"}},
+		},
+		{
+			fields: []string{"a.b.f1", "a.b.f2", "a.b", "a.c"},
+			paths:  [][]string{{"a", "b"}, {"a", "c"}},
+		},
+		{
+			fields: []string{"a.b.f1", "a.b.f2", "a.b", "a.c", "a"},
+			paths:  [][]string{{"a"}},
+		},
+	} {
+		paths, err := ParseNestedFields(tt.fields)
+		if tt.errMsg != "" {
+			require.Error(t, err)
+			require.Equal(t, tt.errMsg, err.Error())
+		} else {
+			require.NoError(t, err)
+			require.Equal(t, tt.paths, paths)
+		}
+	}
+}
+
+func TestHierarchy(t *testing.T) {
+	s := &hierarchy{T: "10"}
+	err := Parse(s, map[string]int{})
+	assert.NoError(t, err, "shouldn't be an error")
+	assert.Equal(t, "10", s.T, "wrong value")
+	assert.Equal(t, "10", s.Child.T, "wrong value")
+
+	s = &hierarchy{
+		T:     "10",
+		Child: hierarchyChild{T: "20"},
+	}
+	err = Parse(s, map[string]int{})
+	assert.NoError(t, err, "shouldn't be an error")
+	assert.Equal(t, "10", s.T, "wrong value")
+	assert.Equal(t, "20", s.Child.T, "wrong value")
+}
+
+func TestSlice(t *testing.T) {
+	s := &sliceStruct{Value: "parent_value", Childs: []sliceChild{{"child_1"}, {}}}
+	SetDefaultValues(s)
+	err := Parse(s, map[string]int{})
+
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, "parent_value", s.Value, "wrong value")
+	assert.Equal(t, "child_1", s.Childs[0].Value, "wrong value")
+	assert.Equal(t, "child", s.Childs[1].Value, "wrong value") // default value
+}
+
+func TestDefaultSlice(t *testing.T) {
+	s := &sliceStruct{Value: "parent_value"}
+	SetDefaultValues(s)
+	err := Parse(s, map[string]int{})
+
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, "parent_value", s.Value, "wrong value")
+	assert.NotEqual(t, nil, s.Childs, "wrong value")
+	assert.Equal(t, 0, len(s.Childs), "wrong value")
+}
+
+func TestBase8Default(t *testing.T) {
+	s := &strBase8{}
+	SetDefaultValues(s)
+	err := Parse(s, nil)
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, int64(438), s.T_)
+}
+
+func TestBase8(t *testing.T) {
+	s := &strBase8{T: "0777"}
+	err := Parse(s, nil)
+	assert.Nil(t, err, "shouldn't be an error")
+	assert.Equal(t, int64(511), s.T_)
+}
+
+func TestApplyEnvs(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		environs [][]string
+		wantJSON string
+		wantErr  string
+	}{
+		{
+			name: "should_ok_when_rewrite",
+			json: `{"vault":{"address": "super_host"}}`,
+			environs: [][]string{
+				{"FILED_VAULT_ADDRESS", "http://127.0.0.1"},
+				{"FILED_VAULT_TOKEN", "example_token"},
+			},
+			wantJSON: `{"vault": {"address": "http://127.0.0.1", "token": "example_token"}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			object, err := simplejson.NewJson([]byte(tt.json))
+			require.NoError(t, err)
+			for _, env := range tt.environs {
+				t.Setenv(env[0], env[1])
+			}
+
+			err = applyEnvs(object)
+
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				got, errEnc := object.Encode()
+				require.NoError(t, errEnc)
+				require.JSONEq(t, tt.wantJSON, string(got))
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+type vaultMock struct {
+	t                                   *testing.T
+	secretPath, secretKey, secretResult string
+	secretErr                           error
+}
+
+func newVaultMock(t *testing.T, path, key, result string, err error) *vaultMock {
+	return &vaultMock{
+		t:            t,
+		secretPath:   path,
+		secretKey:    key,
+		secretResult: result,
+		secretErr:    err,
+	}
+}
+
+func (v *vaultMock) GetSecret(path, key string) (string, error) {
+	assert.Equal(v.t, v.secretPath, path)
+	assert.Equal(v.t, v.secretKey, key)
+	return v.secretResult, v.secretErr
+}
+
+func (v *vaultMock) tryApply(s string) (string, bool) {
+	return tryApplySecreter(v, s)
+}
+
+func TestApplyConfigFuncs(t *testing.T) {
+	tests := []struct {
+		name         string
+		environs     [][]string
+		json         string
+		wantJSON     string
+		wantErr      string
+		secretKey    string
+		secretPath   string
+		secretResult string
+		secretErr    error
+	}{
+		{
+			name:         "should_ok_vault",
+			json:         `{"welcome": {"input": {"type": "vault(test/test, value)"}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type": "result"}}}`,
+		},
+		{
+			name: "should_ok_env",
+			environs: [][]string{
+				{"ENV_1", "VAL_1"},
+			},
+			json:         `{"welcome": {"input": {"type": "env(ENV_1)"}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type": "VAL_1"}}}`,
+		},
+		{
+			name: "should_ok_env_and_vault",
+			environs: [][]string{
+				{"ENV_1", "VAL_1"},
+			},
+			json:         `{"welcome": {"input": {"type_1": "env(ENV_1)", "type_2": "vault(test/test, value)"}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type_1": "VAL_1","type_2": "result"}}}`,
+		},
+		{
+			name:         "should_ok_when_vault_in_array",
+			json:         `{"welcome": {"input": {"type": ["vault(test/test, value)"]}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type": ["result"]}}}`,
+		},
+		{
+			name: "should_ok_when_env_in_array",
+			environs: [][]string{
+				{"ENV_1", "VAL_1"},
+			},
+			json:         `{"welcome": {"input": {"type": ["env(ENV_1)"]}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type": ["VAL_1"]}}}`,
+		},
+		{
+			name: "should_ok_when_env_and_vault_in_array",
+			environs: [][]string{
+				{"ENV_1", "VAL_1"},
+			},
+			json:         `{"welcome": {"input": {"type": ["env(ENV_1)","vault(test/test, value)"]}}}`,
+			secretPath:   "test/test",
+			secretKey:    "value",
+			secretResult: "result",
+			wantJSON:     `{"welcome": {"input": {"type": ["VAL_1","result"]}}}`,
+		},
+		{
+			name:     "should_ok_when_vault_field_escaped",
+			json:     `{"welcome": {"input": {"type": "\\vault(test/test, value)"}}}`,
+			wantJSON: `{"welcome": {"input": {"type": "vault(test/test, value)"}}}`,
+		},
+		{
+			name:     "should_ok_when_env_field_escaped",
+			json:     `{"welcome": {"input": {"type": "\\env(ENV_1)"}}}`,
+			wantJSON: `{"welcome": {"input": {"type": "env(ENV_1)"}}}`,
+		},
+		{
+			name:     "should_ok_when_vault_syntax_invalid_no_bracket",
+			json:     `{"welcome": {"input": {"type": "vault(test/test, value"}}}`,
+			wantJSON: `{"welcome": {"input": {"type": "vault(test/test, value"}}}`,
+		},
+		{
+			name:     "should_ok_when_env_syntax_invalid_no_bracket",
+			json:     `{"welcome": {"input": {"type": "env(ENV_1"}}}`,
+			wantJSON: `{"welcome": {"input": {"type": "env(ENV_1"}}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			object, err := simplejson.NewJson([]byte(tt.json))
+			require.NoError(t, err)
+			for _, env := range tt.environs {
+				t.Setenv(env[0], env[1])
+			}
+
+			vault := newVaultMock(t, tt.secretPath, tt.secretKey, tt.secretResult, tt.secretErr)
+			apps := []funcApplier{vault, &envs{}}
+
+			applyConfigFuncs(apps, object)
+
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				got, errEnc := object.Encode()
+				require.NoError(t, errEnc)
+				require.JSONEq(t, tt.wantJSON, string(got))
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestPipelineValidator(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   []string
+		wantErr bool
+	}{
+		{
+			name:  "valid",
+			input: []string{"pipeline_name", "PipeLine_NAME", "pipelinename", "PIPELINENAME", "pipeline_k8s"},
+		},
+		{
+			name:    "invalid",
+			input:   []string{"Pipeline-name", "pipeline-name", "<pipeline_name>", "пайплайн_нейм"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, s := range tt.input {
+				err := validatePipelineName(s)
+				if tt.wantErr {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+		})
+	}
+}
+
+func TestExpression_UnmarshalJSON(t *testing.T) {
+	val := struct {
+		E1 Expression `parse:"expression"`
+		E2 Expression `parse:"expression"`
+		E3 Expression `parse:"expression"`
+	}{}
+
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"E1": 1,
+		"E2": "2",
+		"E3": "2+2"
+	}`), &val))
+
+	require.Equal(t, Expression("1"), val.E1)
+	require.Equal(t, Expression("2"), val.E2)
+	require.Equal(t, Expression("2+2"), val.E3)
+}
+
+func TestMergeYAMLs(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        map[any]any
+		b        map[any]any
+		expected map[any]any
+	}{
+		{
+			name: "simple merge",
+			a: map[any]any{
+				"key1": "value1",
+				"key2": "value2",
+			},
+			b: map[any]any{
+				"key2": "newValue2",
+				"key3": "value3",
+			},
+			expected: map[any]any{
+				"key1": "value1",
+				"key2": "newValue2",
+				"key3": "value3",
+			},
+		},
+		{
+			name: "nested maps",
+			a: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "subvalue1",
+				},
+			},
+			b: map[any]any{
+				"key1": map[any]any{
+					"subkey2": "subvalue2",
+				},
+				"key2": "value2",
+			},
+			expected: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "subvalue1",
+					"subkey2": "subvalue2",
+				},
+				"key2": "value2",
+			},
+		},
+		{
+			name: "overwriting nested maps",
+			a: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "subvalue1",
+				},
+			},
+			b: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "newSubvalue1",
+					"subkey2": "subvalue2",
+				},
+			},
+			expected: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "newSubvalue1",
+					"subkey2": "subvalue2",
+				},
+			},
+		},
+		{
+			name:     "empty maps",
+			a:        map[any]any{},
+			b:        map[any]any{},
+			expected: map[any]any{
+				// Expecting an empty map
+			},
+		},
+		{
+			name: "a is empty",
+			a:    map[any]any{},
+			b: map[any]any{
+				"key1": "value1",
+			},
+			expected: map[any]any{
+				"key1": "value1",
+			},
+		},
+		{
+			name: "b is empty",
+			a: map[any]any{
+				"key1": "value1",
+			},
+			b: map[any]any{},
+			expected: map[any]any{
+				"key1": "value1",
+			},
+		},
+		{
+			name: "override slice",
+			a: map[any]any{
+				"key1": []any{"value1", "value2"},
+			},
+			b: map[any]any{
+				"key1": []any{"newValue1", "newValue2"},
+			},
+			expected: map[any]any{
+				"key1": []any{"newValue1", "newValue2"},
+			},
+		},
+		{
+			name: "merge slice with map",
+			a: map[any]any{
+				"key1": []any{"value1", "value2"},
+			},
+			b: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "subvalue1",
+				},
+			},
+			expected: map[any]any{
+				"key1": map[any]any{
+					"subkey1": "subvalue1",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			result := mergeYAMLs(tt.a, tt.b)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestBuildFieldSelector(t *testing.T) {
+	tests := []struct {
+		name     string
+		fields   []string
+		expected string
+	}{
+		{
+			name:     "Empty slice",
+			fields:   []string{},
+			expected: "",
+		},
+		{
+			name:     "Single field, no dot",
+			fields:   []string{"field"},
+			expected: "field",
+		},
+		{
+			name:     "Multiple fields, no dots",
+			fields:   []string{"a", "b", "c"},
+			expected: "a.b.c",
+		},
+		{
+			name:     "Field with dot",
+			fields:   []string{"a.b", "c"},
+			expected: "a\\.b.c",
+		},
+		{
+			name:     "All fields with dots",
+			fields:   []string{"a.b", "c.d"},
+			expected: "a\\.b.c\\.d",
+		},
+		{
+			name:     "Field with multiple dots",
+			fields:   []string{"a.b.c", "d"},
+			expected: "a\\.b\\.c.d",
+		},
+		{
+			name:     "Field with backslash",
+			fields:   []string{`a\b`, "c"},
+			expected: `a\b.c`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := BuildFieldSelector(tt.fields)
+			require.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+type primitiveDefaults struct {
+	B   bool    `default:"true"`
+	S   string  `default:"strValue"`
+	I   int     `default:"1"`
+	I8  int8    `default:"2"`
+	I16 int16   `default:"3"`
+	I32 int32   `default:"4"`
+	I64 int64   `default:"5"`
+	U   uint    `default:"6"`
+	U8  uint8   `default:"7"`
+	U16 uint16  `default:"8"`
+	U32 uint32  `default:"9"`
+	U64 uint64  `default:"10"`
+	F32 float32 `default:"11.0"`
+	F64 float64 `default:"12.0"`
+}
+
+type stringSliceDefaults struct {
+	SS []string `default:"str1 str2 str3"`
+}
+
+type childrenDefaults struct {
+	ValueStr   string `json:"value_str" default:"children"`
+	ValueInt64 int64  `json:"value_int64" default:"67"`
+}
+
+type parentDefaults struct {
+	ValueBool bool               `json:"value_bool" default:"true"`
+	Nested    childrenDefaults   `json:"nested"`
+	Children  []childrenDefaults `json:"children"`
+}
+
+func TestSetDefaultValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   any
+		want    any
+		wantErr bool
+	}{
+		{
+			name:  "primitive_types",
+			input: &primitiveDefaults{},
+			want: &primitiveDefaults{
+				B: true, S: "strValue", I: 1,
+				I8: 2, I16: 3, I32: 4,
+				I64: 5, U: 6, U8: 7,
+				U16: 8, U32: 9, U64: 10,
+				F32: 11.0, F64: 12.0,
+			},
+		},
+		{
+			name:  "string_slice",
+			input: &stringSliceDefaults{},
+			want:  &stringSliceDefaults{SS: []string{"str1", "str2", "str3"}},
+		},
+		{
+			name: "recurse_into_struct_and_slice_elements",
+			input: &parentDefaults{
+				Children: []childrenDefaults{
+					{ValueStr: "str"},
+					{},
+				},
+			},
+			want: &parentDefaults{
+				ValueBool: true,
+				Nested:    childrenDefaults{ValueStr: "children", ValueInt64: 67},
+				Children: []childrenDefaults{
+					{ValueStr: "str", ValueInt64: 67},
+					{ValueStr: "children", ValueInt64: 67},
+				},
+			},
+		},
+		{
+			name: "err_negative_default_for_uint",
+			input: &struct {
+				U uint `default:"-1"`
+			}{},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := SetDefaultValues(tt.input)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.want, tt.input)
+		})
+	}
+}
+
+func TestPreallocSlicesFromJson(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantLen int
+	}{
+		{
+			name:    "preallocate_struct_slice",
+			input:   `{"children":[{},{"value_str":"size"}]}`,
+			wantLen: 2,
+		},
+		{
+			name:    "preallocate_empty_slice",
+			input:   `{"children":[]}`,
+			wantLen: 0,
+		},
+		{
+			name:    "nil_object",
+			input:   ``,
+			wantLen: -1,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var root *simplejson.Json
+			if tt.input != "" {
+				var err error
+				root, err = simplejson.NewJson([]byte(tt.input))
+				require.NoError(t, err)
+			}
+
+			got := &parentDefaults{}
+			require.NoError(t, preallocSlicesFromJSON(reflect.ValueOf(got), root))
+
+			if tt.wantLen == -1 {
+				require.Nil(t, got.Children)
+				return
+			}
+
+			require.Len(t, got.Children, tt.wantLen)
+		})
+	}
+}
+
+func TestDecodeConfig(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  *parentDefaults
+	}{
+		{
+			name:  "empty_json_set_all_defaults",
+			input: `{}`,
+			want: &parentDefaults{
+				ValueBool: true,
+				Nested: childrenDefaults{
+					ValueStr: "children", ValueInt64: 67,
+				},
+			},
+		},
+		{
+			name:  "bool_false_overrides_default_true",
+			input: `{"value_bool":false}`,
+			want: &parentDefaults{
+				ValueBool: false,
+				Nested: childrenDefaults{
+					ValueStr: "children", ValueInt64: 67,
+				},
+			},
+		},
+		{
+			name:  "slice_element_defaults_applied_for_missing_fields",
+			input: `{"children":[{"value_str":"first"}, {"value_int64":52}]}`,
+			want: &parentDefaults{
+				ValueBool: true,
+				Nested:    childrenDefaults{ValueStr: "children", ValueInt64: 67},
+				Children: []childrenDefaults{
+					{ValueStr: "first", ValueInt64: 67},
+					{ValueStr: "children", ValueInt64: 52},
+				},
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := &parentDefaults{}
+			require.NoError(t, DecodeConfig(got, []byte(tt.input)))
+			require.Equal(t, tt.want, got)
+		})
+	}
+}

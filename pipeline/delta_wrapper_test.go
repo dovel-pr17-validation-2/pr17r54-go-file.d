@@ -1,0 +1,22 @@
+package pipeline
+
+import (
+	"math/rand"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func TestDeltaWrapper(t *testing.T) {
+	dw := newDeltaWrapper()
+	assert.Equal(t, int64(0), dw.get())
+
+	initial := int64(0)
+
+	for range 1000000 {
+		delta := rand.Int63n(5000)
+		initial += delta
+		assert.Equal(t, delta, int64(dw.updateValue(initial)))
+		assert.Equal(t, initial, dw.get())
+	}
+}

@@ -1,0 +1,853 @@
+package clickhouse
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ClickHouse/ch-go"
+	"github.com/ClickHouse/ch-go/chpool"
+	"github.com/ClickHouse/ch-go/proto"
+	"github.com/ozontech/file.d/cfg"
+	"github.com/ozontech/file.d/fd"
+	"github.com/ozontech/file.d/metric"
+	"github.com/ozontech/file.d/pipeline"
+	"github.com/ozontech/file.d/xtime"
+	"github.com/ozontech/file.d/xtls"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+/*{ introduction
+It sends the event batches to Clickhouse database using
+[Native format](https://clickhouse.com/docs/en/interfaces/formats/#native) and
+[Native protocol](https://clickhouse.com/docs/en/interfaces/tcp/).
+
+File.d uses low level Go client - [ch-go](https://github.com/ClickHouse/ch-go) to provide these features.
+
+Supports [dead queue](/plugin/output/README.md#dead-queue).
+}*/
+
+const (
+	outPluginType = "clickhouse"
+)
+
+var errNoAvailableClickhouseAddresses = errors.New("no available clickhouse addresses")
+
+type Clickhouse interface {
+	Close()
+	Do(ctx context.Context, query ch.Query) error
+}
+
+type instance struct {
+	addr Address
+	pool Clickhouse
+}
+
+type Plugin struct {
+	logger *zap.Logger
+
+	config     *Config
+	batcher    *pipeline.RetriableBatcher
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+
+	query string
+
+	// TODO: support shards
+	instances []instance
+	requestID atomic.Uint64
+
+	// plugin metrics
+	insertErrorsMetric    *metric.Counter
+	queriesCountMetric    *metric.Counter
+	bannedEndpointsMetric *metric.Gauge
+
+	router *pipeline.Router
+
+	compression ch.Compression
+	tlsConfig   *tls.Config
+
+	cbEnabled    bool
+	poolsByAddr  map[Address]Clickhouse
+	bannedHosts  map[Address]time.Time
+	pendingHosts map[Address]struct{}
+	mu           sync.RWMutex
+}
+
+type Setting struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	Important bool   `json:"important"`
+}
+
+type Settings []Setting
+
+func (s Settings) toProtoSettings() []ch.Setting {
+	result := make([]ch.Setting, 0, len(s))
+	for _, setting := range s {
+		result = append(result, ch.Setting{
+			Key:       setting.Key,
+			Value:     setting.Value,
+			Important: setting.Important,
+		})
+	}
+	return result
+}
+
+type Column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type InsertStrategy byte
+
+const (
+	StrategyRoundRobin InsertStrategy = iota
+	StrategyInOrder
+)
+
+type Address struct {
+	Addr   string `json:"addr"`
+	Weight *int   `json:"weight,omitempty"`
+}
+
+func (a *Address) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 {
+		return nil
+	}
+
+	defaultWeight := 1
+
+	switch b[0] {
+	case '"':
+		a.Weight = &defaultWeight
+		return json.Unmarshal(b, &a.Addr)
+	case '{':
+		type tmpAddress Address
+		tmp := tmpAddress{}
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.DisallowUnknownFields()
+		err := dec.Decode(&tmp)
+		if tmp.Weight == nil {
+			tmp.Weight = &defaultWeight
+		}
+		*a = Address(tmp)
+		return err
+	default:
+		return errors.New("failed to unmarshal to Address, the value must be string or object")
+	}
+}
+
+var _ json.Unmarshaler = (*Address)(nil)
+
+// ! config-params
+// ^ config-params
+type Config struct {
+	// > @3@4@5@6
+	// >
+	// > TCP Clickhouse addresses, e.g.: 127.0.0.1:9000.
+	// > Check the insert_strategy to find out how File.d will behave with a list of addresses.
+	// >
+	// > Accepts strings or objects, e.g.:
+	// > ```yaml
+	// > addresses:
+	// >   - 127.0.0.1:9000 # the same as {addr:'127.0.0.1:9000',weight:1}
+	// >   - addr: 127.0.0.1:9001
+	// >     weight: 2
+	// > ```
+	// >
+	// > When some addresses get weight greater than 1 and round_robin insert strategy is used,
+	// > it works as classical weighted round-robin. Given {(a_1,w_1),(a_1,w_1),...,{a_n,w_n}},
+	// > where a_i is the ith address and w_i is the ith address' weight, requests are sent in order:
+	// > w_1 times to a_1, w_2 times to a_2, ..., w_n times to a_n, w_1 times to a_1 and so on.
+	Addresses []Address `json:"addresses" required:"true" slice:"true"` // *
+
+	// > @3@4@5@6
+	// >
+	// > If more than one addresses are set, File.d will insert batches depends on the strategy:
+	// > round_robin - File.d will send requests in the round-robin order.
+	// > in_order - File.d will send requests starting from the first address, ending with the number of retries.
+	InsertStrategy  string `json:"insert_strategy" default:"round_robin" options:"round_robin|in_order"` // *
+	InsertStrategy_ InsertStrategy
+
+	// > @3@4@5@6
+	// >
+	// > CA certificate in PEM encoding. This can be a path or the content of the certificate.
+	CACert string `json:"ca_cert" default:""` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse database name to search the table.
+	Database string `json:"database" default:"default"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse database user.
+	User string `json:"user" default:"default"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse database password.
+	Password string `json:"password" default:""` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse quota key.
+	// > https://clickhouse.com/docs/en/operations/quotas
+	QuotaKey string `json:"quota_key" default:""` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse target table.
+	Table string `json:"table" required:"true"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Clickhouse table columns. Each column must contain `name` and `type`.
+	// > File.d supports next data types:
+	// > * **Signed and unsigned integers** from 8 to 64 bits.
+	// > If you set 128-256 bits – File.d will cast the number to the int64.
+	// > * **DateTime** and **DateTime64** – File.d automatically determines whether a timestamp in JSON is in RFC3339Nano
+	// > or Unix timestamp format when attempting to parse it. Unix timestamp has some requirements:
+	// >   * Value should be a positive integer with the string or number json type.
+	// >   * Precision must match the column type in **ClickHouse**:
+	// >     - **DateTime** → Unix timestamp in **seconds**.
+	// >     - **DateTime64(3)** → Unix timestamp in **milliseconds**.
+	// >     - **DateTime64(6)** → Unix timestamp in **microseconds**.
+	// >     - **DateTime64(9)** → Unix timestamp in **nanoseconds**.
+	// >     - If the timestamp precision in JSON does not match the ClickHouse column type, the data may be processed incorrectly.
+	// > * **String**
+	// > * **Enum8** and **Enum16**
+	// > * **Bool**
+	// > * **Nullable**
+	// > * **IPv4**, **IPv6**
+	// > * **LowCardinality(String)**
+	// > * **Array(String)**
+	// > * **Map(String,String)**
+	// >
+	// > If file.d fails convert JSON to the correct data type for Clickhouse, it will log **sampled** errors.
+	// >
+	// > If you need more types, please, create an issue.
+	Columns []Column `json:"columns" required:"true"` // *
+
+	// > @3@4@5@6
+	// >
+	// > If true, file.d fails when types are mismatched.
+	// >
+	// > If false, file.d will cast any JSON type to the column type.
+	// >
+	// > For example, if strict_types is false and an event value is a Number,
+	// > but the column type is a Bool, the Number will be converted to the "true"
+	// > if the value is "1".
+	// > But if the value is an Object and the column is an Int
+	// > File.d converts the Object to "0" to prevent fall.
+	// >
+	// > In the non-strict mode, for String and Array(String) columns the value will be encoded to JSON.
+	// >
+	// > If the strict mode is enabled file.d fails (exit with code 1) in above examples.
+	StrictTypes bool `json:"strict_types" default:"false"` // *
+
+	// > @3@4@5@6
+	// >
+	// > The level of the Compression.
+	// > Disabled - lowest CPU overhead.
+	// > LZ4 - medium CPU overhead.
+	// > ZSTD - high CPU overhead.
+	// > None - uses no compression but data has checksums.
+	Compression string `default:"disabled" options:"disabled|lz4|zstd|none"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Retries of insertion. If File.d cannot insert for this number of attempts,
+	// > File.d will fall with non-zero exit code or skip message (see fatal_on_failed_insert).
+	Retry int `json:"retry" default:"10"` // *
+
+	// > @3@4@5@6
+	// >
+	// > After an insert error, fall with a non-zero exit code or not. A configured deadqueue disables fatal exits.
+	FatalOnFailedInsert bool `json:"fatal_on_failed_insert" default:"false"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Additional settings to the Clickhouse.
+	// > Settings list: https://clickhouse.com/docs/en/operations/settings/settings
+	ClickhouseSettings Settings `json:"clickhouse_settings"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Retention milliseconds for retry to DB.
+	Retention  cfg.Duration `json:"retention" default:"50ms" parse:"duration"` // *
+	Retention_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > Multiplier for exponential increase of retention between retries
+	RetentionExponentMultiplier int `json:"retention_exponentially_multiplier" default:"2"` // *
+
+	// > @3@4@5@6
+	// >
+	// > Timeout for each insert request.
+	InsertTimeout  cfg.Duration `json:"insert_timeout" default:"10s" parse:"duration"` // *
+	InsertTimeout_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > Max connections in the connection pool.
+	MaxConns  cfg.Expression `json:"max_conns" default:"gomaxprocs*4"  parse:"expression"` // *
+	MaxConns_ int32
+
+	// > @3@4@5@6
+	// >
+	// > Min connections in the connection pool.
+	MinConns  cfg.Expression `json:"min_conns" default:"gomaxprocs*1"  parse:"expression"` // *
+	MinConns_ int32
+
+	// > @3@4@5@6
+	// >
+	// > How long a connection lives before it is killed and recreated.
+	MaxConnLifetime  cfg.Duration `json:"max_conn_lifetime" default:"30m" parse:"duration"` // *
+	MaxConnLifetime_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > How long an unused connection lives before it is killed.
+	MaxConnIdleTime  cfg.Duration `json:"max_conn_idle_time" default:"5m" parse:"duration"` // *
+	MaxConnIdleTime_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > How often to check that idle connections is time to kill.
+	HealthCheckPeriod  cfg.Duration `json:"health_check_period" default:"1m" parse:"duration"` // *
+	HealthCheckPeriod_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > How much workers will be instantiated to send batches.
+	// > It also configures the amount of minimum and maximum number of database connections.
+	WorkersCount  cfg.Expression `json:"workers_count" default:"gomaxprocs*4" parse:"expression"` // *
+	WorkersCount_ int
+
+	// > @3@4@5@6
+	// >
+	// > Maximum quantity of events to pack into one batch.
+	BatchSize  cfg.Expression `json:"batch_size" default:"capacity/4"  parse:"expression"` // *
+	BatchSize_ int
+
+	// > @3@4@5@6
+	// >
+	// > A minimum size of events in a batch to send.
+	// > If both batch_size and batch_size_bytes are set, they will work together.
+	BatchSizeBytes  cfg.Expression `json:"batch_size_bytes" default:"0" parse:"expression"` // *
+	BatchSizeBytes_ int
+
+	// > @3@4@5@6
+	// >
+	// > After this timeout batch will be sent even if batch isn't completed.
+	BatchFlushTimeout  cfg.Duration `json:"batch_flush_timeout" default:"200ms" parse:"duration"` // *
+	BatchFlushTimeout_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > Period for which addresses will be banned in case of unavailability.
+	BanPeriod  cfg.Duration `json:"ban_period" default:"0s" parse:"duration"` // *
+	BanPeriod_ time.Duration
+
+	// > @3@4@5@6
+	// >
+	// > Interval for reconnecting to addresses that are unavailable during initialization.
+	ReconnectInterval  cfg.Duration `json:"reconnect_interval" default:"5s" parse:"duration"` // *
+	ReconnectInterval_ time.Duration
+}
+
+func init() {
+	fd.DefaultPluginRegistry.RegisterOutput(&pipeline.PluginStaticInfo{
+		Type:    outPluginType,
+		Factory: Factory,
+	})
+}
+
+func Factory() (pipeline.AnyPlugin, pipeline.AnyConfig) {
+	return &Plugin{}, &Config{}
+}
+
+func (p *Plugin) registerMetrics(ctl *metric.Ctl) {
+	p.insertErrorsMetric = ctl.RegisterCounter("output_clickhouse_errors_total", "Total clickhouse insert errors")
+	p.queriesCountMetric = ctl.RegisterCounter("output_clickhouse_queries_count_total", "How many queries sent by clickhouse output plugin")
+	p.bannedEndpointsMetric = ctl.RegisterGauge("output_clickhouse_banned_endpoints", "Current number of endpoints banned by circuit breaker")
+	p.bannedEndpointsMetric.Set(0)
+}
+
+func (p *Plugin) Start(config pipeline.AnyConfig, params *pipeline.OutputPluginParams) {
+	p.logger = params.Logger.Desugar()
+	p.config = config.(*Config)
+
+	if len(p.config.Addresses) == 0 {
+		p.logger.Fatal("config.addresses can't be empty")
+	}
+
+	p.pendingHosts = make(map[Address]struct{}, len(p.config.Addresses))
+	p.poolsByAddr = make(map[Address]Clickhouse, len(p.config.Addresses))
+
+	p.registerMetrics(params.MetricCtl)
+	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
+
+	if p.config.Retention_ < 1 {
+		p.logger.Fatal("'retention' can't be <1")
+	}
+	if p.config.InsertTimeout_ < 1 {
+		p.logger.Fatal("'db_request_timeout' can't be <1")
+	}
+	if p.config.ReconnectInterval_ < 1 {
+		p.logger.Fatal("'reconnect_interval' can't be <1")
+	}
+	if p.config.BanPeriod_ < 0 {
+		p.logger.Fatal("'ban_period' cant't be <0")
+	}
+
+	p.cbEnabled = p.config.BanPeriod_ > 0 && len(p.config.Addresses) > 1
+	logFields := []zap.Field{
+		zap.Duration("ban_period", p.config.BanPeriod_),
+		zap.Duration("reconnect_interval", p.config.ReconnectInterval_),
+		zap.Int("addresses_count", len(p.config.Addresses)),
+	}
+
+	logMsg := "circuit breaker disabled"
+	if p.cbEnabled {
+		logMsg = "circuit breaker enabled"
+	}
+	p.logger.Info(logMsg, logFields...)
+
+	schema, err := inferInsaneColInputs(p.config.Columns)
+	if err != nil {
+		p.logger.Fatal("invalid database schema", zap.Error(err))
+	}
+	input := inputFromColumns(schema)
+	p.query = input.Into(p.config.Table)
+
+	switch p.config.InsertStrategy {
+	case "round_robin":
+		p.config.InsertStrategy_ = StrategyRoundRobin
+	case "in_order":
+		p.config.InsertStrategy_ = StrategyInOrder
+	}
+
+	switch strings.ToLower(p.config.Compression) {
+	default:
+		fallthrough
+	case "disabled":
+		p.compression = ch.CompressionDisabled
+	case "lz4":
+		p.compression = ch.CompressionLZ4
+	case "zstd":
+		p.compression = ch.CompressionZSTD
+	case "none":
+		p.compression = ch.CompressionNone
+	}
+
+	if p.config.CACert != "" {
+		b := xtls.NewConfigBuilder()
+		if err := b.AppendCARoot(p.config.CACert); err != nil {
+			p.logger.Fatal("can't append CA root", zap.Error(err))
+		}
+		p.tlsConfig = b.Build()
+	}
+
+	for _, addr := range p.config.Addresses {
+		pool, err := p.createConnection(addr)
+		if err != nil {
+			var netError net.Error
+			if errors.As(err, &netError) {
+				p.pendingHosts[addr] = struct{}{}
+			}
+			p.logger.Error("create clickhouse connection pool", zap.Error(err), zap.String("addr", addr.Addr))
+			continue
+		}
+		p.poolsByAddr[addr] = pool
+		for j := 0; j < *addr.Weight; j++ {
+			p.instances = append(p.instances, instance{
+				addr: addr,
+				pool: pool,
+			})
+		}
+	}
+
+	if len(p.instances) == 0 && p.config.FatalOnFailedInsert {
+		p.logger.Fatal("cannot start: no available clickhouse addresses in config")
+	}
+
+	if p.cbEnabled {
+		p.bannedHosts = make(map[Address]time.Time, len(p.config.Addresses))
+		go p.checkBannedHosts()
+	}
+
+	if len(p.pendingHosts) > 0 {
+		go p.checkPendingHosts()
+	}
+
+	batcherOpts := pipeline.BatcherOptions{
+		PipelineName:   params.PipelineName,
+		OutputType:     outPluginType,
+		Controller:     params.Controller,
+		Workers:        p.config.WorkersCount_,
+		BatchSizeCount: p.config.BatchSize_,
+		BatchSizeBytes: p.config.BatchSizeBytes_,
+		FlushTimeout:   p.config.BatchFlushTimeout_,
+		MetricCtl:      params.MetricCtl,
+	}
+
+	p.router = params.Router
+	backoffOpts := pipeline.BackoffOpts{
+		MinRetention:         p.config.Retention_,
+		Multiplier:           float64(p.config.RetentionExponentMultiplier),
+		AttemptNum:           p.config.Retry,
+		IsDeadQueueAvailable: p.router.IsDeadQueueAvailable(),
+	}
+
+	onError := func(err error, events []*pipeline.Event) {
+		var level zapcore.Level
+		if p.config.FatalOnFailedInsert && !p.router.IsDeadQueueAvailable() {
+			level = zapcore.FatalLevel
+		} else {
+			level = zapcore.ErrorLevel
+		}
+
+		p.logger.Log(level, "can't insert to the table", zap.Error(err),
+			zap.Int("retries", p.config.Retry),
+			zap.String("table", p.config.Table))
+
+		for i := range events {
+			p.router.Fail(events[i])
+		}
+	}
+
+	p.batcher = pipeline.NewRetriableBatcher(
+		&batcherOpts,
+		p.out,
+		backoffOpts,
+		onError,
+	)
+
+	p.batcher.Start(p.ctx)
+}
+
+func (p *Plugin) createConnection(addr Address) (*chpool.Pool, error) {
+	addr.Addr = addrWithDefaultPort(addr.Addr, "9000")
+	return chpool.New(p.ctx, chpool.Options{
+		ClientOptions: ch.Options{
+			Logger:           p.logger.Named("driver"),
+			Address:          addr.Addr,
+			Database:         p.config.Database,
+			User:             p.config.User,
+			Password:         p.config.Password,
+			QuotaKey:         p.config.QuotaKey,
+			Compression:      p.compression,
+			Settings:         p.config.ClickhouseSettings.toProtoSettings(),
+			DialTimeout:      time.Second * 10,
+			TLS:              p.tlsConfig,
+			HandshakeTimeout: time.Minute,
+		},
+		MaxConnLifetime:   p.config.MaxConnLifetime_,
+		MaxConnIdleTime:   p.config.MaxConnIdleTime_,
+		MaxConns:          p.config.MaxConns_,
+		MinConns:          p.config.MinConns_,
+		HealthCheckPeriod: p.config.HealthCheckPeriod_,
+	})
+}
+
+func (p *Plugin) checkPendingHosts() {
+	ticker := time.NewTicker(p.config.ReconnectInterval_)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			if len(p.pendingHosts) == 0 {
+				return
+			}
+
+			for addr := range p.pendingHosts {
+				pool, err := p.createConnection(addr)
+				if err != nil {
+					p.logger.Error("failed to reconnect to pending host", zap.Error(err), zap.String("addr", addr.Addr))
+					continue
+				}
+
+				p.mu.Lock()
+				p.poolsByAddr[addr] = pool
+				for range *addr.Weight {
+					p.instances = append(p.instances, instance{
+						addr: addr,
+						pool: pool,
+					})
+				}
+				delete(p.pendingHosts, addr)
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (p *Plugin) checkBannedHosts() {
+	ticker := time.NewTicker(p.config.ReconnectInterval_)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-ticker.C:
+			restoredAddresses := make([]string, 0, len(p.config.Addresses))
+			p.mu.Lock()
+			for addr, banUntil := range p.bannedHosts {
+				if !xtime.GetInaccurateTime().After(banUntil) {
+					continue
+				}
+				pool := p.poolsByAddr[addr]
+				for i := 0; i < *addr.Weight; i++ {
+					p.instances = append(p.instances, instance{
+						addr: addr,
+						pool: pool,
+					})
+				}
+				delete(p.bannedHosts, addr)
+				restoredAddresses = append(restoredAddresses, addr.Addr)
+			}
+			activeCount, bannedCount := len(p.instances), len(p.bannedHosts)
+			p.mu.Unlock()
+
+			if len(restoredAddresses) > 0 {
+				p.logger.Info("clickhouse hosts restored",
+					zap.Strings("addrs", restoredAddresses),
+					zap.Int("active_instances", activeCount),
+					zap.Int("banned_hosts", bannedCount),
+				)
+				p.bannedEndpointsMetric.Set(float64(bannedCount))
+			}
+		}
+	}
+}
+
+func (p *Plugin) Stop() {
+	p.cancelFunc()
+	p.batcher.Stop()
+
+	for _, pool := range p.poolsByAddr {
+		pool.Close()
+	}
+}
+
+func (p *Plugin) Out(event *pipeline.Event) {
+	p.batcher.Add(event)
+}
+
+type data struct {
+	cols  []InsaneColumn
+	input proto.Input
+}
+
+func (d data) reset() {
+	for i := range d.cols {
+		d.cols[i].ColInput.Reset()
+	}
+}
+
+func (p *Plugin) out(workerData *pipeline.WorkerData, batch *pipeline.Batch) error {
+	if *workerData == nil {
+		// we don't check the error, schema already validated in the Start
+		columns, _ := inferInsaneColInputs(p.config.Columns)
+		input := inputFromColumns(columns)
+		*workerData = data{
+			cols:  columns,
+			input: input,
+		}
+	}
+
+	data := (*workerData).(data)
+	data.reset()
+
+	errorLogged := false
+	batch.ForEach(func(event *pipeline.Event) {
+		for _, col := range data.cols {
+			node := event.Root.Dig(col.Name)
+
+			var insaneNode InsaneNode
+			if node != nil && p.config.StrictTypes {
+				insaneNode = StrictNode{node.MutateToStrict()}
+			} else if node != nil {
+				insaneNode = NonStrictNode{node}
+			}
+
+			if err := col.ColInput.Append(insaneNode); err != nil {
+				if !errorLogged {
+					// Log only 1 error per batch to avoid spam.
+					errorLogged = true
+					p.logger.Error("failed to encode value into Clickhouse column, zero value will be used",
+						zap.Error(err), zap.String("col", col.Name), zap.String("value", node.AsString()))
+				}
+
+				// We can't append the value to the column because of the node has wrong format,
+				// so append zero value to be able to send a batch.
+				err := col.ColInput.Append(ZeroValueNode{})
+				if err != nil {
+					panic(fmt.Errorf("BUG: failed to append zero value to column: %s", err))
+				}
+			}
+		}
+	})
+
+	p.mu.RLock()
+	attempts := len(p.instances)
+	p.mu.RUnlock()
+
+	var err error
+	if attempts == 0 {
+		p.logger.Warn("all clickhouse hosts banned, failing back to all hosts")
+		if err := p.fallbackInsert(data.input); err == nil {
+			return nil
+		}
+
+		if p.config.FatalOnFailedInsert {
+			p.logger.Fatal("cannot start: no available clickhouse addresses in config")
+		}
+
+		err = errNoAvailableClickhouseAddresses
+		p.insertErrorsMetric.Inc()
+		p.logger.Error("no available clickhouse addresses", zap.Error(err))
+
+		return err
+	}
+
+	for i := range attempts {
+		requestID := p.requestID.Add(1)
+
+		p.mu.RLock()
+		if len(p.instances) == 0 {
+			p.mu.RUnlock()
+			err = errNoAvailableClickhouseAddresses
+			break
+		}
+		instance := p.getInstance(requestID, i)
+		p.mu.RUnlock()
+
+		err = p.do(instance.pool, data.input)
+		if err == nil {
+			return nil
+		}
+
+		var netError net.Error
+		if errors.As(err, &netError) || errors.Is(err, context.DeadlineExceeded) {
+			p.banInstance(instance.addr, err)
+		}
+	}
+	if err != nil {
+		p.insertErrorsMetric.Inc()
+		if errors.Is(err, errNoAvailableClickhouseAddresses) {
+			p.logger.Error("no available clickhouse addresses", zap.Error(err))
+		} else {
+			p.logger.Error("an attempt to insert a batch failed", zap.Error(err))
+		}
+	}
+
+	return err
+}
+
+func (p *Plugin) do(clickhouse Clickhouse, queryInput proto.Input) error {
+	defer p.queriesCountMetric.Inc()
+
+	ctx, cancel := context.WithTimeout(p.ctx, p.config.InsertTimeout_)
+	defer cancel()
+
+	return clickhouse.Do(ctx, ch.Query{
+		Body:  p.query,
+		Input: queryInput,
+	})
+}
+
+func (p *Plugin) fallbackInsert(input proto.Input) error {
+	lastErr := errNoAvailableClickhouseAddresses
+
+	for range len(p.config.Addresses) {
+		idx := int(p.requestID.Add(1) % uint64(len(p.config.Addresses)))
+		addr := p.config.Addresses[idx]
+
+		p.mu.RLock()
+		pool := p.poolsByAddr[addr]
+		p.mu.RUnlock()
+
+		if pool == nil {
+			continue
+		}
+
+		if err := p.do(pool, input); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	return lastErr
+}
+
+func (p *Plugin) banInstance(addr Address, err error) {
+	if !p.cbEnabled {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	filtered := p.instances[:0]
+	for _, it := range p.instances {
+		if it.addr != addr {
+			filtered = append(filtered, it)
+		}
+	}
+
+	p.instances = filtered
+	p.bannedHosts[addr] = xtime.GetInaccurateTime().Add(p.config.BanPeriod_)
+	activeCount, bannedCount := len(p.instances), len(p.bannedHosts)
+
+	p.logger.Warn("clickhouse host banned",
+		zap.Error(err),
+		zap.String("addr", addr.Addr),
+		zap.Duration("ban_period", p.config.BanPeriod_),
+		zap.Int("active_instances", activeCount),
+		zap.Int("banned_hosts", bannedCount),
+	)
+
+	p.bannedEndpointsMetric.Set(float64(bannedCount))
+}
+
+func (p *Plugin) getInstance(requestID uint64, retry int) instance {
+	var instanceIdx int
+	switch p.config.InsertStrategy_ {
+	case StrategyInOrder:
+		instanceIdx = retry % len(p.instances)
+	case StrategyRoundRobin:
+		instanceIdx = int(requestID % uint64(len(p.instances)))
+	}
+	return p.instances[instanceIdx]
+}
+
+func addrWithDefaultPort(addr string, defaultPort string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// port isn't specified
+		return net.JoinHostPort(addr, defaultPort)
+	}
+	if port == "" {
+		return addr + defaultPort
+	}
+	return addr
+}

@@ -1,0 +1,32 @@
+- **Getting started**
+  - [Overview](/README.md)
+  - [Quick start](/docs/quick-start.md)
+  - [Installation](/docs/installation.md)
+  - [Examples](/docs/examples.md)
+  - [Configuring](/docs/configuring.md)
+
+- **Documentation**
+  - [Architecture](/docs/architecture.md)
+  - [Benchmarks](/docs/benchmarks.md)
+  - [Guarantees](/docs/guarantees.md)
+  - [Optimization tips](/docs/optimization-tips.md)
+
+- **Plugins**
+  - Input
+@global-contents-table-plugin-input|links-list
+  - Action
+@global-contents-table-plugin-action|links-list
+  - [Output](/plugin/output/README.md)
+@global-contents-table-plugin-output|links-list
+
+- **Pipeline**
+  - [About](/pipeline/README.md)
+  - [Settings](/pipeline/README.md#settings)
+  - [Datetime parse formats](/pipeline/README.md#datetime-parse-formats)
+  - [Match modes](/pipeline/README.md#match-modes)
+  - [Experimental: Do If rules](/pipeline/doif/README.md#experimental-do-if-rules)
+  - [Decoder](/decoder/readme.md)
+
+- **Other**
+  - [Contributing](/docs/contributing.md)
+  - [License](/docs/license.md)

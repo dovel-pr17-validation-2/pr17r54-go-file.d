@@ -1,0 +1,1080 @@
+package pipeline
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"runtime"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ozontech/file.d/decoder"
+	"github.com/ozontech/file.d/logger"
+	"github.com/ozontech/file.d/metric"
+	"github.com/ozontech/file.d/pipeline/antispam"
+	"github.com/ozontech/file.d/pipeline/metadata"
+	insaneJSON "github.com/ozontech/insane-json"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+const (
+	DefaultAntispamThreshold         = -1
+	DefaultSourceNameMetaField       = ""
+	DefaultDecoder                   = "auto"
+	DefaultIsStrict                  = false
+	DefaultStreamField               = "stream"
+	DefaultCapacity                  = 1024
+	DefaultAvgInputEventSize         = 4 * 1024
+	DefaultMaxInputEventSize         = 0
+	DefaultCutOffEventByLimit        = false
+	DefaultCutOffEventByLimitField   = ""
+	DefaultJSONNodePoolSize          = 16
+	DefaultMaintenanceInterval       = time.Second * 5
+	DefaultEventTimeout              = time.Second * 30
+	DefaultFieldValue                = "not_set"
+	DefaultStreamName                = StreamName("not_set")
+	DefaultMetricHoldDuration        = time.Minute * 30
+	DefaultMetaCacheSize             = 1024
+	DefaultMetricMaxLabelValueLength = 0
+
+	EventSeqIDError = uint64(0)
+
+	antispamUnbanIterations = 4
+)
+
+type finalizeFn = func(event *Event, notifyInput bool, backEvent bool)
+
+type InputPluginController interface {
+	In(sourceID SourceID, sourceName string, offsets Offsets, data []byte, isNewSource bool, meta metadata.MetaData) uint64
+	UseSpread()                            // don't use stream field and spread all events across all processors
+	DisableStreams()                       // don't use stream field
+	SuggestDecoder(t decoder.Type)         // set decoder type if pipeline uses "auto" value for decoder
+	IncReadOps()                           // inc read ops for metric
+	IncMaxEventSizeExceeded(lvs ...string) // inc max event size exceeded counter
+}
+
+type ActionPluginController interface {
+	Propagate(event *Event) // throw held event back to pipeline
+	Spawn(parent *Event, nodes []*insaneJSON.Node)
+	IncMaxEventSizeExceeded(lvs ...string) // inc max event size exceeded counter
+}
+
+type OutputPluginController interface {
+	Commit(event *Event) // notify input plugin that event is successfully processed and save offsets
+	Error(err string)
+}
+
+type (
+	SourceID   uint64
+	StreamName string
+)
+
+type pool interface {
+	get(size int) *Event
+	back(event *Event)
+	dump() string
+	inUse() int64
+	stop()
+	waiters() int64
+}
+
+type Pipeline struct {
+	Name     string
+	started  bool
+	settings *Settings
+
+	decoderType     decoder.Type // decoder type set in the config
+	decoder         decoder.Decoder
+	initDecoderOnce *sync.Once
+
+	eventPool pool
+	streamer  *streamer
+
+	useSpread      bool
+	disableStreams bool
+	singleProc     bool
+	shouldStop     atomic.Bool
+
+	input      InputPlugin
+	inputInfo  *InputPluginInfo
+	antispamer *antispam.Antispammer
+	metricCtl  *metric.Ctl
+
+	actionInfos   []*ActionPluginStaticInfo
+	actionMetrics actionMetrics
+	actionParams  PluginDefaultParams
+
+	Procs       []*processor
+	procCount   *atomic.Int32
+	activeProcs *atomic.Int32
+
+	router *Router
+
+	// some debugging stuff
+	logger          *zap.Logger
+	eventLogEnabled bool
+	eventLog        []string
+	eventLogMu      *sync.Mutex
+
+	inputEvents  atomic.Int64
+	inputSize    atomic.Int64
+	outputEvents atomic.Int64
+	outputSize   atomic.Int64
+	readOps      atomic.Int64
+
+	// all pipeline`s metrics
+	inUseEventsMetric          *metric.Gauge
+	eventPoolCapacityMetric    *metric.Gauge
+	inputEventsCountMetric     *metric.Counter
+	inputEventSizeMetric       *metric.Counter
+	outputEventsCountMetric    *metric.Counter
+	outputEventSizeMetric      *metric.Counter
+	readOpsEventsSizeMetric    *metric.Counter
+	wrongEventCRIFormatMetric  *metric.Counter
+	maxEventSizeExceededMetric *metric.CounterVec
+	eventPoolLatency           *metric.Histogram
+
+	countEventPanicsRecoveredMetric *metric.Counter
+}
+
+type Settings struct {
+	Decoder                 string
+	DecoderParams           decoder.Params
+	Capacity                int
+	MetaCacheSize           int
+	MaintenanceInterval     time.Duration
+	EventTimeout            time.Duration
+	Antispam                AntispamSettings
+	SourceNameMetaField     string
+	AvgEventSize            int
+	MaxEventSize            int
+	CutOffEventByLimit      bool
+	CutOffEventByLimitField string
+	StreamField             string
+	IsStrict                bool
+	Pool                    PoolType
+	Metric                  *MetricSettings
+}
+
+type MetricSettings struct {
+	HoldDuration        time.Duration
+	MaxLabelValueLength int
+}
+
+type AntispamSettings struct {
+	Threshold           int
+	Rules               antispam.Rules
+	Exceptions          antispam.Exceptions
+	MaintenanceInterval time.Duration
+	Sampler             *antispam.Sampler
+}
+
+type PoolType string
+
+const (
+	PoolTypeStd    PoolType = "std"
+	PoolTypeLowMem PoolType = "low_memory"
+)
+
+// New creates new pipeline. Consider using `SetupHTTPHandlers` next.
+func New(name string, settings *Settings, registry *prometheus.Registry, lg *zap.Logger) *Pipeline {
+	metricCtl := metric.NewCtl("pipeline_"+name, registry, settings.Metric.HoldDuration, settings.Metric.MaxLabelValueLength)
+
+	var eventPool pool
+	switch settings.Pool {
+	case PoolTypeStd:
+		eventPool = newEventPool(settings.Capacity, settings.AvgEventSize)
+	case PoolTypeLowMem, "":
+		eventPool = newLowMemoryEventPool(settings.Capacity)
+	default:
+		logger.Fatal("unknown pool type", zap.String("pool", string(settings.Pool)))
+	}
+
+	pipeline := &Pipeline{
+		Name:           name,
+		logger:         lg,
+		settings:       settings,
+		useSpread:      false,
+		disableStreams: false,
+		actionParams: PluginDefaultParams{
+			PipelineName:     name,
+			PipelineSettings: settings,
+			MetricCtl:        metricCtl,
+		},
+		router: NewRouter(),
+		actionMetrics: actionMetrics{
+			m:  make(map[string]*actionMetric),
+			mu: new(sync.RWMutex),
+		},
+		streamer:  newStreamer(settings.EventTimeout),
+		eventPool: eventPool,
+		antispamer: antispam.NewAntispammer(&antispam.Options{
+			Threshold:           settings.Antispam.Threshold,
+			MaintenanceInterval: settings.Antispam.MaintenanceInterval,
+			UnbanIterations:     antispamUnbanIterations,
+			Logger:              lg.Named("antispam"),
+			MetricsController:   metricCtl,
+			Rules:               settings.Antispam.Rules,
+			Exceptions:          settings.Antispam.Exceptions,
+			Sampler:             settings.Antispam.Sampler,
+		}),
+		metricCtl: metricCtl,
+
+		eventLog:   make([]string, 0, 128),
+		eventLogMu: &sync.Mutex{},
+
+		initDecoderOnce: &sync.Once{},
+	}
+
+	pipeline.registerMetrics()
+	pipeline.setDefaultMetrics()
+
+	pipeline.decoderType = decoder.TypeFromString(settings.Decoder)
+	if pipeline.decoderType == decoder.NO {
+		pipeline.logger.Fatal("unknown decoder", zap.String("decoder", settings.Decoder))
+	}
+
+	var err error
+	pipeline.decoder, err = decoder.New(pipeline.decoderType, pipeline.settings.DecoderParams)
+	if err != nil {
+		pipeline.logger.Fatal("can't create decoder", zap.String("decoder", settings.Decoder), zap.Error(err))
+	}
+
+	return pipeline
+}
+
+func (p *Pipeline) IncReadOps() {
+	p.readOps.Add(1)
+}
+
+func (p *Pipeline) IncMaxEventSizeExceeded(lvs ...string) {
+	p.maxEventSizeExceededMetric.WithLabelValues(lvs...).Inc()
+}
+
+func (p *Pipeline) IncCountEventPanicsRecovered() {
+	p.countEventPanicsRecoveredMetric.Inc()
+}
+
+func (p *Pipeline) registerMetrics() {
+	m := p.actionParams.MetricCtl
+	p.inUseEventsMetric = m.RegisterGauge("event_pool_in_use_events", "Count of pool events which is used for processing")
+	p.eventPoolCapacityMetric = m.RegisterGauge("event_pool_capacity", "Pool capacity value")
+	p.inputEventsCountMetric = m.RegisterCounter("input_plugin_events_count_total", "Count of events on pipeline input")
+	p.inputEventSizeMetric = m.RegisterCounter("input_plugin_events_size_total", "Size of events on pipeline input")
+	p.outputEventsCountMetric = m.RegisterCounter("output_plugin_events_count_total", "Count of events on pipeline output")
+	p.outputEventSizeMetric = m.RegisterCounter("output_plugin_events_size_total", "Size of events on pipeline output")
+	p.readOpsEventsSizeMetric = m.RegisterCounter("read_ops_count_total", "Read OPS count")
+	p.wrongEventCRIFormatMetric = m.RegisterCounter("wrong_event_cri_format_total", "Wrong event CRI format counter")
+	p.maxEventSizeExceededMetric = m.RegisterCounterVec("max_event_size_exceeded_total", "Max event size exceeded counter", "source_name")
+	p.countEventPanicsRecoveredMetric = m.RegisterCounter("count_event_panics_recovered_total", "Count of processor.countEvent panics recovered")
+	p.eventPoolLatency = m.RegisterHistogram("event_pool_latency_seconds", "How long we are wait an event from the pool", metric.SecondsBucketsDetailedNano)
+}
+
+func (p *Pipeline) setDefaultMetrics() {
+	p.eventPoolCapacityMetric.Set(float64(p.settings.Capacity))
+}
+
+// SetupHTTPHandlers creates handlers for plugin endpoints and pipeline info.
+// Plugin endpoints can be accessed via
+// URL `/pipelines/<pipeline_name>/<plugin_index_in_config>/<plugin_endpoint>`.
+// Input plugin has the index of zero, output plugin has the last index.
+// Actions also have the standard endpoints `/info` and `/sample`.
+func (p *Pipeline) SetupHTTPHandlers(mux *http.ServeMux) {
+	if p.input == nil {
+		p.logger.Panic("input isn't set")
+	}
+	if p.router.output == nil {
+		p.logger.Panic("output isn't set")
+	}
+
+	prefix := "/pipelines/" + p.Name
+	mux.HandleFunc(prefix, p.servePipeline)
+	prefixBanList := fmt.Sprintf("/pipelines/%s/ban_list", p.Name)
+	mux.HandleFunc(prefixBanList, p.servePipelineBanList)
+	for hName, handler := range p.inputInfo.PluginStaticInfo.Endpoints {
+		mux.HandleFunc(fmt.Sprintf("%s/0/%s", prefix, hName), handler)
+	}
+
+	for i, info := range p.actionInfos {
+		mux.HandleFunc(fmt.Sprintf("%s/%d/info", prefix, i+1), p.serveActionInfo(info))
+		mux.HandleFunc(fmt.Sprintf("%s/%d/sample", prefix, i+1), p.serveActionSample(i))
+		for hName, handler := range info.PluginStaticInfo.Endpoints {
+			mux.HandleFunc(fmt.Sprintf("%s/%d/%s", prefix, i+1, hName), handler)
+		}
+	}
+
+	for hName, handler := range p.router.outputInfo.PluginStaticInfo.Endpoints {
+		mux.HandleFunc(fmt.Sprintf("%s/%d/%s", prefix, len(p.actionInfos)+1, hName), handler)
+	}
+}
+
+func (p *Pipeline) Start() {
+	if p.input == nil {
+		p.logger.Panic("input isn't set")
+	}
+	if p.router.output == nil {
+		p.logger.Panic("output isn't set")
+	}
+
+	p.initProcs()
+
+	outputParams := &OutputPluginParams{
+		PluginDefaultParams: p.actionParams,
+		Controller:          p,
+		Logger:              p.logger.Sugar().Named("output").Named(p.router.outputInfo.Type),
+	}
+	p.logger.Info("starting output plugin", zap.String("name", p.router.outputInfo.Type))
+
+	p.router.Start(outputParams)
+
+	p.logger.Info("stating processors", zap.Int("count", len(p.Procs)))
+	for _, processor := range p.Procs {
+		processor.start(p.actionParams, p.logger.Sugar())
+	}
+
+	p.logger.Info("starting input plugin", zap.String("name", p.inputInfo.Type))
+	inputParams := &InputPluginParams{
+		PluginDefaultParams: p.actionParams,
+		Controller:          p,
+		Logger:              p.logger.Sugar().Named("input").Named(p.inputInfo.Type),
+	}
+
+	p.input.Start(p.inputInfo.Config, inputParams)
+
+	p.streamer.start()
+
+	go p.maintenance()
+	go p.antispammerMaintenance()
+	if !p.useSpread {
+		go p.growProcs()
+	}
+	p.started = true
+}
+
+func (p *Pipeline) Stop() {
+	p.logger.Info("stopping pipeline", zap.Int64("committed", p.outputEvents.Load()))
+
+	p.logger.Info("stopping processors", zap.Int32("count", p.procCount.Load()))
+	for _, processor := range p.Procs {
+		processor.stop()
+	}
+
+	p.streamer.stop()
+
+	p.logger.Info("stopping input")
+	p.input.Stop()
+
+	p.logger.Info("stopping output")
+	p.router.Stop()
+
+	p.shouldStop.Store(true)
+
+	p.eventPool.stop()
+}
+
+func (p *Pipeline) SetInput(info *InputPluginInfo) {
+	p.inputInfo = info
+	p.input = info.Plugin.(InputPlugin)
+}
+
+func (p *Pipeline) GetInput() InputPlugin {
+	return p.input
+}
+
+func (p *Pipeline) SetOutput(info *OutputPluginInfo) {
+	p.router.SetOutput(info)
+}
+
+func (p *Pipeline) SetDeadQueueOutput(info *OutputPluginInfo) {
+	p.router.SetDeadQueueOutput(info)
+}
+
+func (p *Pipeline) GetOutput() OutputPlugin {
+	return p.router.output
+}
+
+// In decodes message and passes it to event stream.
+func (p *Pipeline) In(sourceID SourceID, sourceName string, offsets Offsets, bytes []byte, isNewSource bool, meta metadata.MetaData) (seqID uint64) {
+	var (
+		ok              bool
+		cutoff          bool
+		antispamSampled bool
+	)
+	// don't process mud.
+	bytes, cutoff, ok = p.checkInputBytes(bytes, sourceName, meta)
+	if !ok {
+		return EventSeqIDError
+	}
+	length := len(bytes)
+
+	p.initDecoderOnce.Do(func() {
+		// If decoder is still set to AUTO after input plugin start, it means
+		// no plugin called SuggestDecoder to override it.
+		// In this case, the JSON decoder is used by default.
+		if p.decoderType == decoder.AUTO {
+			p.decoderType = decoder.JSON
+			p.decoder, _ = decoder.New(decoder.JSON, nil)
+		}
+	})
+
+	var (
+		dec decoder.Type
+		row decoder.CRIRow
+		err error
+	)
+
+	dec = p.decoderType
+	if dec == decoder.CRI {
+		row, err = decoder.DecodeCRI(bytes)
+		if err != nil {
+			p.wrongEventCRIFormatMetric.Inc()
+			p.Error(fmt.Sprintf("wrong cri format offset=%d, length=%d, err=%s, source=%d:%s, cri=%s", offsets.current, length, err.Error(), sourceID, sourceName, bytes))
+			return EventSeqIDError
+		}
+	}
+
+	if p.settings.Antispam.Threshold >= 0 {
+		streamOffset := offsets.ByStream(string(row.Stream))
+		currentOffset := offsets.current
+
+		if streamOffset > 0 && currentOffset < streamOffset {
+			return EventSeqIDError
+		}
+
+		var checkSourceID string
+		var checkSourceName string
+		if p.settings.SourceNameMetaField == "" {
+			checkSourceID = strconv.FormatUint(uint64(sourceID), 10)
+			checkSourceName = sourceName
+		} else {
+			if val, ok := meta[p.settings.SourceNameMetaField]; ok {
+				checkSourceID = val
+				checkSourceName = val
+				isNewSource = false
+			} else {
+				p.Error(fmt.Sprintf("source_name_meta_field %q does not exists in meta", p.settings.SourceNameMetaField))
+				checkSourceID = strconv.FormatUint(uint64(sourceID), 10)
+				checkSourceName = sourceName
+			}
+		}
+
+		var eventTime time.Time
+		if len(row.Time) > 0 {
+			eventTime, err = time.Parse("2006-01-02T15:04:05.999999999Z", string(row.Time))
+			if err != nil {
+				p.Error(fmt.Sprintf("cannot parse raw time %s: %v", row.Time, err))
+			}
+		}
+
+		checkBytes := bytes
+		if len(row.Log) > 0 {
+			checkBytes = row.Log
+		}
+		spamResult := p.antispamer.IsSpam(
+			antispam.SourceData{ID: checkSourceID, Name: checkSourceName, IsNew: isNewSource},
+			antispam.EventData{Bytes: checkBytes, Time: eventTime, IsPartial: row.IsPartial},
+			meta,
+		)
+		switch spamResult {
+		case antispam.Dropped:
+			return EventSeqIDError
+		case antispam.Sampled:
+			antispamSampled = true
+		}
+	}
+
+	p.inputEvents.Add(1)
+	p.inputSize.Add(int64(length))
+
+	now := time.Now()
+	event := p.eventPool.get(len(bytes))
+	p.eventPoolLatency.Observe(time.Since(now).Seconds())
+
+	err = nil
+	if !(dec == decoder.JSON || dec == decoder.PROTOBUF) {
+		_ = event.Root.DecodeString("{}")
+	}
+	switch dec {
+	case decoder.JSON, decoder.NGINX_ERROR, decoder.PROTOBUF,
+		decoder.SYSLOG_RFC3164, decoder.SYSLOG_RFC5424, decoder.CSV:
+		err = p.decoder.DecodeToJson(event.Root, bytes)
+	case decoder.RAW:
+		if bytes[len(bytes)-1] == '\n' {
+			event.Root.AddFieldNoAlloc(event.Root, "message").MutateToBytesCopy(event.Root, bytes[:len(bytes)-1])
+		} else {
+			event.Root.AddFieldNoAlloc(event.Root, "message").MutateToBytesCopy(event.Root, bytes)
+		}
+	case decoder.CRI:
+		event.Root.AddFieldNoAlloc(event.Root, "log").MutateToBytesCopy(event.Root, row.Log)
+		event.Root.AddFieldNoAlloc(event.Root, "time").MutateToBytesCopy(event.Root, row.Time)
+		event.Root.AddFieldNoAlloc(event.Root, "stream").MutateToBytesCopy(event.Root, row.Stream)
+	case decoder.POSTGRES:
+		err = decoder.DecodePostgresToJson(event.Root, bytes)
+	default:
+		p.logger.Panic("unknown decoder", zap.Int("decoder", int(dec)))
+	}
+
+	if err != nil {
+		level := zapcore.ErrorLevel
+		if p.settings.IsStrict {
+			level = zapcore.FatalLevel
+		}
+
+		p.logger.Log(level, "wrong log format", zap.Error(err),
+			zap.Int64("offset", offsets.current),
+			zap.Int("length", length),
+			zap.Uint64("source", uint64(sourceID)),
+			zap.String("source_name", sourceName),
+			zap.ByteString("log", bytes))
+
+		// Can't process event, return to pool.
+		p.eventPool.back(event)
+		return EventSeqIDError
+	}
+
+	if len(meta) > 0 {
+		if event.Root.IsArray() {
+			nodeArray := event.Root.AsArray()
+			for _, elem := range nodeArray {
+				if elem.IsObject() {
+					for k, v := range meta {
+						elem.AddField(k).MutateToString(v)
+					}
+				}
+			}
+		} else {
+			for k, v := range meta {
+				CreateNestedField(event.Root, []string{k}).MutateToString(v)
+			}
+		}
+	}
+	if cutoff && p.settings.CutOffEventByLimitField != "" {
+		event.Root.AddFieldNoAlloc(event.Root, p.settings.CutOffEventByLimitField).MutateToBool(true)
+	}
+	if antispamSampled {
+		// cfg is always non-nil here: antispamSampled is set only when the sampler is configured.
+		cfg := p.settings.Antispam.Sampler
+		if cfg.MarkerField != "" {
+			event.Root.AddFieldNoAlloc(event.Root, cfg.MarkerField).MutateToBool(true)
+		}
+
+		if sm := p.antispamer.SamplerMetric(); sm != nil {
+			values := make([]string, 0, len(cfg.MetricLabels))
+			for _, path := range cfg.MetricLabels {
+				v := "not_set"
+				if node := event.Root.Dig(path); node != nil {
+					v = node.AsString()
+				}
+				values = append(values, v)
+			}
+			sm.WithLabelValues(values...).Inc()
+		}
+	}
+
+	event.Offset = offsets.current
+	event.SourceID = sourceID
+	event.SourceName = sourceName
+	event.streamName = DefaultStreamName
+
+	return p.streamEvent(event)
+}
+
+func (p *Pipeline) checkInputBytes(bytes []byte, sourceName string, meta metadata.MetaData) ([]byte, bool, bool) {
+	length := len(bytes)
+
+	if length == 0 || (bytes[0] == '\n' && length == 1) {
+		return bytes, false, false
+	}
+
+	if p.settings.MaxEventSize != 0 && length > p.settings.MaxEventSize {
+		source := sourceName
+		if val, ok := meta[p.settings.SourceNameMetaField]; ok {
+			source = val
+		}
+		p.IncMaxEventSizeExceeded(source)
+
+		if !p.settings.CutOffEventByLimit {
+			return bytes, false, false
+		}
+
+		wasNewLine := bytes[len(bytes)-1] == '\n'
+		bytes = bytes[:p.settings.MaxEventSize]
+		if wasNewLine {
+			bytes = append(bytes, '\n')
+		}
+		return bytes, true, true
+	}
+
+	return bytes, false, true
+}
+
+func (p *Pipeline) streamEvent(event *Event) uint64 {
+	streamID := StreamID(event.SourceID)
+
+	// spread events across all processors
+	if p.useSpread {
+		streamID = StreamID(event.SeqID % uint64(p.procCount.Load()))
+	}
+
+	if !p.disableStreams {
+		node := event.Root.Dig(p.settings.StreamField)
+		if node != nil {
+			event.streamName = StreamName(node.AsString())
+		}
+
+		if pass := p.input.PassEvent(event); !pass {
+			// Can't process event, return to pool.
+			p.eventPool.back(event)
+			return EventSeqIDError
+		}
+	}
+
+	return p.streamer.putEvent(streamID, event.streamName, event)
+}
+
+func (p *Pipeline) Commit(event *Event) {
+	p.router.Ack(event)
+	p.finalize(event, true, true)
+}
+
+func (p *Pipeline) Error(err string) {
+	if p.settings.IsStrict {
+		logger.Fatal(err)
+	} else {
+		logger.Error(err)
+	}
+}
+
+func (p *Pipeline) finalize(event *Event, notifyInput bool, backEvent bool) {
+	if event.IsTimeoutKind() || event.IsChildKind() {
+		return
+	}
+
+	if notifyInput {
+		p.input.Commit(event)
+		p.outputEvents.Add(1)
+		p.outputSize.Add(int64(event.Size))
+	}
+
+	// todo: avoid event.stream.commit(event)
+	event.stream.commit(event)
+
+	if !backEvent {
+		return
+	}
+
+	if p.eventLogEnabled {
+		p.eventLogMu.Lock()
+		p.eventLog = append(p.eventLog, event.Root.EncodeToString())
+		p.eventLogMu.Unlock()
+	}
+
+	for i, e := range event.children {
+		insaneJSON.Release(e.Root)
+		event.children[i] = nil
+	}
+
+	p.eventPool.back(event)
+}
+
+type actionMetric struct {
+	count *metric.CounterVec
+	size  *metric.CounterVec
+	// totalCounter is a map of eventStatus to counter for `/info` endpoint.
+	totalCounter map[string]*atomic.Uint64
+}
+
+type actionMetrics struct {
+	m  map[string]*actionMetric
+	mu *sync.RWMutex
+}
+
+func (am *actionMetrics) set(name string, m *actionMetric) {
+	if name == "" {
+		return
+	}
+
+	am.mu.Lock()
+	am.m[name] = m
+	am.mu.Unlock()
+}
+
+func (am *actionMetrics) get(name string) *actionMetric {
+	if name == "" {
+		return nil
+	}
+
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	return am.m[name]
+}
+
+func (p *Pipeline) AddAction(info *ActionPluginStaticInfo) {
+	p.actionInfos = append(p.actionInfos, info)
+
+	labels := make([]string, 0, len(info.MetricLabels)+1)
+	if !info.MetricSkipStatus {
+		labels = append(labels, "status")
+	}
+	labels = append(labels, info.MetricLabels...)
+
+	count := p.metricCtl.RegisterCounterVec(
+		info.MetricName+"_events_count_total",
+		fmt.Sprintf("how many events processed by pipeline %q and #%d action", p.Name, len(p.actionInfos)-1),
+		labels...,
+	)
+	p.metricCtl.AddToHolder(count)
+
+	size := p.metricCtl.RegisterCounterVec(
+		info.MetricName+"_events_size_total",
+		fmt.Sprintf("total size of events processed by pipeline %q and #%d action", p.Name, len(p.actionInfos)-1),
+		labels...,
+	)
+	p.metricCtl.AddToHolder(size)
+
+	totalCounter := make(map[string]*atomic.Uint64)
+	for _, st := range allEventStatuses() {
+		totalCounter[string(st)] = &atomic.Uint64{}
+	}
+
+	p.actionMetrics.set(info.MetricName, &actionMetric{
+		count:        count,
+		size:         size,
+		totalCounter: totalCounter,
+	})
+}
+
+func (p *Pipeline) initProcs() {
+	// default proc count is CPU cores * 2
+	procCount := runtime.GOMAXPROCS(0) * 2
+	if p.singleProc {
+		procCount = 1
+	}
+	p.logger.Info("starting pipeline", zap.Int("procs", procCount))
+
+	p.procCount = &atomic.Int32{}
+	p.procCount.Store(int32(procCount))
+	p.activeProcs = &atomic.Int32{}
+
+	p.Procs = make([]*processor, 0, procCount)
+	for i := 0; i < procCount; i++ {
+		p.Procs = append(p.Procs, p.newProc(i))
+	}
+}
+
+func (p *Pipeline) newProc(id int) *processor {
+	proc := newProcessor(
+		id,
+		&p.actionMetrics,
+		p.activeProcs,
+		p.router,
+		p.streamer,
+		p.finalize,
+		p.IncMaxEventSizeExceeded,
+		p.IncCountEventPanicsRecovered,
+	)
+	for j, info := range p.actionInfos {
+		plugin, _ := info.Factory()
+		proc.AddActionPlugin(&ActionPluginInfo{
+			ActionPluginStaticInfo: info,
+			PluginRuntimeInfo: &PluginRuntimeInfo{
+				Plugin: plugin,
+				ID:     strconv.Itoa(proc.id) + "_" + strconv.Itoa(j),
+			},
+		})
+	}
+
+	return proc
+}
+
+func (p *Pipeline) growProcs() {
+	interval := time.Millisecond * 100
+	t := time.Now()
+	for {
+		time.Sleep(interval)
+		if p.shouldStop.Load() {
+			return
+		}
+		if p.procCount.Load() != p.activeProcs.Load() {
+			continue
+		}
+
+		if time.Since(t) > interval {
+			p.expandProcs()
+			t = time.Now()
+		}
+	}
+}
+
+func (p *Pipeline) expandProcs() {
+	if p.singleProc {
+		return
+	}
+
+	from := p.procCount.Load()
+	to := from * 2
+	p.logger.Info("processors count expanded from %d to %d", zap.Int32("old", from), zap.Int32("new", to))
+	if to > 10000 {
+		p.logger.Warn("too many processors", zap.Int32("new", to))
+	}
+
+	// proc IDs are added starting from the next after the last one
+	// so all procs have unique IDs
+	for x := 1; x <= int(to-from); x++ {
+		proc := p.newProc(p.Procs[from-1].id + x)
+		p.Procs = append(p.Procs, proc)
+		proc.start(p.actionParams, p.logger.Sugar())
+	}
+
+	p.procCount.Swap(to)
+}
+
+type deltas struct {
+	deltaInputEvents  float64
+	deltaInputSize    float64
+	deltaOutputEvents float64
+	deltaOutputSize   float64
+	deltaReads        float64
+}
+
+func (p *Pipeline) logChanges(myDeltas *deltas) {
+	if ce := p.logger.Check(zapcore.InfoLevel, "pipeline stats"); ce != nil {
+		inputSize := p.inputSize.Load()
+		inputEvents := p.inputEvents.Load()
+		inUseEvents := p.eventPool.inUse()
+
+		interval := p.settings.MaintenanceInterval
+		rate := int(myDeltas.deltaInputEvents * float64(time.Second) / float64(interval))
+		rateMb := myDeltas.deltaInputSize * float64(time.Second) / float64(interval) / 1024 / 1024
+		readOps := int(myDeltas.deltaReads * float64(time.Second) / float64(interval))
+		tc := int64(math.Max(float64(inputSize), 1))
+
+		stat := fmt.Sprintf(`interval=%ds, active procs=%d/%d, events in use=%d/%d, out=%d|%.1fMb,`+
+			` rate=%d/s|%.1fMb/s, read ops=%d/s, total=%d|%.1fMb, avg size=%d`,
+			interval/time.Second, p.activeProcs.Load(), p.procCount.Load(),
+			inUseEvents, p.settings.Capacity,
+			int64(myDeltas.deltaInputEvents), myDeltas.deltaInputSize/1024.0/1024.0, rate, rateMb, readOps,
+			inputEvents, float64(inputSize)/1024.0/1024.0, inputSize/tc)
+
+		ce.Write(zap.String("stat", stat))
+	}
+}
+
+func (p *Pipeline) incMetrics(inputEvents, inputSize, outputEvents, outputSize, reads *DeltaWrapper) *deltas {
+	deltaInputEvents := inputEvents.updateValue(p.inputEvents.Load())
+	deltaInputSize := inputSize.updateValue(p.inputSize.Load())
+	deltaOutputEvents := outputEvents.updateValue(p.outputEvents.Load())
+	deltaOutputSize := outputSize.updateValue(p.outputSize.Load())
+	deltaReads := reads.updateValue(p.readOps.Load())
+
+	myDeltas := &deltas{
+		deltaInputEvents,
+		deltaInputSize,
+		deltaOutputEvents,
+		deltaOutputSize,
+		deltaReads,
+	}
+
+	p.inputEventsCountMetric.Add(myDeltas.deltaInputEvents)
+	p.inputEventSizeMetric.Add(myDeltas.deltaInputSize)
+	p.outputEventsCountMetric.Add(myDeltas.deltaOutputEvents)
+	p.outputEventSizeMetric.Add(myDeltas.deltaOutputSize)
+	p.readOpsEventsSizeMetric.Add(myDeltas.deltaReads)
+
+	return myDeltas
+}
+
+func (p *Pipeline) setMetrics(inUseEvents int64) {
+	p.inUseEventsMetric.Set(float64(inUseEvents))
+}
+
+func (p *Pipeline) maintenance() {
+	inputEvents := newDeltaWrapper()
+	inputSize := newDeltaWrapper()
+	outputEvents := newDeltaWrapper()
+	outputSize := newDeltaWrapper()
+	readOps := newDeltaWrapper()
+
+	for {
+		time.Sleep(p.settings.MaintenanceInterval)
+		if p.shouldStop.Load() {
+			return
+		}
+
+		p.metricCtl.Maintenance()
+
+		myDeltas := p.incMetrics(inputEvents, inputSize, outputEvents, outputSize, readOps)
+		p.setMetrics(p.eventPool.inUse())
+		p.logChanges(myDeltas)
+	}
+}
+
+func (p *Pipeline) antispammerMaintenance() {
+	for {
+		time.Sleep(p.settings.Antispam.MaintenanceInterval)
+		if p.shouldStop.Load() {
+			return
+		}
+
+		p.antispamer.Maintenance()
+	}
+}
+
+func (p *Pipeline) UseSpread() {
+	if p.started {
+		p.logger.Panic("don't use (*Pipeline).UseSpread after the pipeline has started")
+	}
+	p.useSpread = true
+}
+
+func (p *Pipeline) DisableStreams() {
+	p.disableStreams = true
+}
+
+// SuggestDecoder applies a decoder hint from input plugins (k8s only for now)
+// when pipeline decoder is set to "auto".
+// The first non-No suggestion wins and permanently replaces pipeline decoder.
+func (p *Pipeline) SuggestDecoder(t decoder.Type) {
+	if p.decoderType != decoder.AUTO || t == decoder.NO {
+		return
+	}
+
+	p.decoderType = t
+	var err error
+	p.decoder, err = decoder.New(t, p.settings.DecoderParams)
+	if err != nil {
+		p.logger.Fatal("can't create decoder", zap.Error(err))
+	}
+}
+
+func (p *Pipeline) DisableParallelism() {
+	p.singleProc = true
+}
+
+func (p *Pipeline) GetEventsTotal() int {
+	return int(p.outputEvents.Load())
+}
+
+func (p *Pipeline) EnableEventLog() {
+	p.eventLogEnabled = true
+}
+
+func (p *Pipeline) GetEventLogItem(index int) string {
+	p.eventLogMu.Lock()
+	defer p.eventLogMu.Unlock()
+
+	if index >= len(p.eventLog) {
+		p.logger.Fatal("can't find log item", zap.Int("index", index))
+	}
+	return p.eventLog[index]
+}
+
+func (p *Pipeline) servePipeline(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("<html><body><pre><p>"))
+	_, _ = w.Write([]byte(logger.Header("pipeline " + p.Name)))
+	_, _ = w.Write([]byte(p.streamer.dump()))
+	_, _ = w.Write([]byte(p.eventPool.dump()))
+
+	_, _ = w.Write([]byte("</p></pre></body></html>"))
+}
+
+func (p *Pipeline) servePipelineBanList(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("<html><body><pre><p>"))
+	_, _ = w.Write([]byte(logger.Header("pipeline " + p.Name)))
+	_, _ = w.Write([]byte(p.antispamer.Dump()))
+
+	_, _ = w.Write([]byte("</p></pre></body></html>"))
+}
+
+// serveActionInfo creates a handlerFunc for the given action.
+// it returns metric values for the given action.
+func (p *Pipeline) serveActionInfo(info *ActionPluginStaticInfo) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Content-Type", "application/json")
+
+		type Event struct {
+			Status string `json:"status"`
+			Count  int    `json:"count"`
+		}
+
+		if info.MetricName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			writeErr(w, "If you want to see a statistic about events, consider adding `metric_name` to the action's configuration.")
+
+			return
+		}
+
+		am := p.actionMetrics.get(info.MetricName)
+
+		var events []Event
+		for _, status := range []eventStatus{
+			eventStatusReceived,
+			eventStatusDiscarded,
+			eventStatusPassed,
+		} {
+			c := am.totalCounter[string(status)]
+			if c == nil {
+				c = &atomic.Uint64{}
+			}
+			events = append(events, Event{
+				Status: string(status),
+				Count:  int(c.Load()),
+			})
+		}
+
+		resp, _ := json.Marshal(events)
+		_, _ = w.Write(resp)
+	}
+}
+
+// serveActionSample creates a handlerFunc for the given action.
+// The func watch every processor, store their events before and after processing,
+// and returns the first result from the fastest processor.
+func (p *Pipeline) serveActionSample(actionIndex int) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Content-Type", "application/json")
+
+		if p.activeProcs.Load() <= 0 || p.procCount.Load() <= 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			writeErr(w, "There are no active processors")
+
+			return
+		}
+
+		timeout := 5 * time.Second
+
+		samples := make(chan sample, len(p.Procs))
+		for _, proc := range p.Procs {
+			go func(proc *processor) {
+				if sample, err := proc.actionWatcher.watch(actionIndex, timeout); err == nil {
+					samples <- *sample
+				}
+			}(proc)
+		}
+
+		select {
+		case firstSample := <-samples:
+			_, _ = w.Write(firstSample.Marshal())
+		case <-time.After(timeout):
+			w.WriteHeader(http.StatusInternalServerError)
+			writeErr(w, "Timeout while try to display an event before and after the action processing.")
+		}
+	}
+}
+
+func writeErr(w io.Writer, err string) {
+	type ErrResp struct {
+		Error string `json:"error"`
+	}
+
+	respErr, _ := json.Marshal(ErrResp{
+		Error: err,
+	})
+	_, _ = w.Write(respErr)
+}

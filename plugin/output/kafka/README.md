@@ -1,0 +1,222 @@
+# Kafka output
+It sends the event batches to kafka brokers using `franz-go` lib.
+
+Supports [dead queue](/plugin/output/README.md#dead-queue).
+
+### Config params
+**`brokers`** *`[]string`* *`required`* 
+
+List of kafka brokers to write to.
+
+<br>
+
+**`default_topic`** *`string`* *`required`* 
+
+The default topic name if nothing will be found in the event field or `should_use_topic_field` isn't set.
+
+<br>
+
+**`client_id`** *`string`* *`default=file-d`* 
+
+Kafka client ID.
+
+<br>
+
+**`use_topic_field`** *`bool`* *`default=false`* 
+
+If set, the plugin will use topic name from the event field.
+
+<br>
+
+**`topic_field`** *`string`* *`default=topic`* 
+
+Which event field to use as topic name. It works only if `should_use_topic_field` is set.
+
+<br>
+
+**`workers_count`** *`cfg.Expression`* *`default=gomaxprocs*4`* 
+
+How many workers will be instantiated to send batches.
+
+<br>
+
+**`batch_size`** *`cfg.Expression`* *`default=capacity/4`* 
+
+A maximum quantity of the events to pack into one batch.
+
+<br>
+
+**`batch_size_bytes`** *`cfg.Expression`* *`default=0`* 
+
+A minimum size of events in a batch to send.
+If both batch_size and batch_size_bytes are set, they will work together.
+
+<br>
+
+**`batch_flush_timeout`** *`cfg.Duration`* *`default=200ms`* 
+
+After this timeout the batch will be sent even if batch isn't full.
+
+<br>
+
+**`timeout`** *`cfg.Duration`* *`default=15s`* 
+
+Timeout for the produce request
+
+<br>
+
+**`max_message_bytes`** *`cfg.Expression`* *`default=1000000`* 
+
+The maximum permitted size of a message.
+Should be set equal to or smaller than the broker's `message.max.bytes`.
+
+<br>
+
+**`encoding`** *`encoder.EncodingConfig`* 
+
+Configure event serialization before sending.
+Includes:
+1) `type` - codec to use for serializing events (`json` by default):
+* `json` - serializes the full event as a JSON object.
+* `raw`  - extracts a single field and sends its value as-is (unquoted
+  for string fields, encoded JSON otherwise). If the field is missing an
+  empty value is sent and a warning is logged.
+2) `params` - encoder parameters, keyed by encoder type:
+* `json` - none.
+* `raw`:
+  * `field` - event field to extract (default `message`); supports
+    nested paths such as `log.message`.
+
+Example sending only the `message` field as a raw value:
+```yaml
+encoding:
+  type: raw
+  params:
+    field: message
+```
+
+<br>
+
+**`compression`** *`string`* *`default=none`* *`options=none|gzip|snappy|lz4|zstd`* 
+
+Compression codec
+
+<br>
+
+**`ack`** *`string`* *`default=leader`* *`options=no|leader|all-isr`* 
+
+Required acks for produced records
+
+<br>
+
+**`retry`** *`int`* *`default=10`* 
+
+Retries of insertion. If File.d cannot insert for this number of attempts,
+File.d will fall with non-zero exit code or skip message (see fatal_on_failed_insert).
+
+There are situations when one of the brokers is disconnected and the client does not have time to
+update the metadata before all the remaining retries are finished. To avoid this situation,
+the client.ForceMetadataRefresh() function is used for some ProduceSync errors:
+- kerr.LeaderNotAvailable - There is no leader for this topic-partition as we are in the middle of a leadership election.
+- kerr.NotLeaderForPartition - This server is not the leader for that topic-partition.
+
+<br>
+
+**`fatal_on_failed_insert`** *`bool`* *`default=false`* 
+
+After an insert error, fall with a non-zero exit code or not. A configured deadqueue disables fatal exits.
+
+<br>
+
+**`retention`** *`cfg.Duration`* *`default=50ms`* 
+
+Retention milliseconds for retry.
+
+<br>
+
+**`retention_exponentially_multiplier`** *`int`* *`default=2`* 
+
+Multiplier for exponential increase of retention between retries
+
+<br>
+
+**`is_sasl_enabled`** *`bool`* *`default=false`* 
+
+If set, the plugin will use SASL authentications mechanism.
+
+<br>
+
+**`sasl_mechanism`** *`string`* *`default=SCRAM-SHA-512`* *`options=PLAIN|SCRAM-SHA-256|SCRAM-SHA-512|AWS_MSK_IAM|OAUTHBEARER`* 
+
+SASL mechanism to use.
+
+<br>
+
+**`sasl_username`** *`string`* *`default=user`* 
+
+SASL username.
+
+<br>
+
+**`sasl_password`** *`string`* *`default=password`* 
+
+SASL password.
+
+<br>
+
+**`sasl_oauth`** *`cfg.KafkaClientOAuthConfig`* 
+
+SASL OAUTHBEARER config. It works only if `sasl_mechanism:"OAUTHBEARER"`.
+> There are 2 options - a static token or a dynamically updated.
+
+`OAuthConfig` params:
+* **`token`** *`string`* - static token
+
+* **`client_id`** *`string`* - client ID
+* **`client_secret`** *`string`* - client secret
+* **`token_url`** *`string`* - resource server's token endpoint URL
+* **`scopes`** *`[]string`* - optional requested permissions
+* **`auth_style`** *`string`* *`default=params`* *`options=params|header`* - specifies how the endpoint wants the client ID & client secret sent
+
+* **`tls`** *`TLSConfig`* - tls config
+
+`TLSConfig` params:
+* **`ca_cert`** *`string`* - path or content of a PEM-encoded CA file
+* **`client_cert`** *`string`* - path or content of a PEM-encoded client certificate file
+* **`client_key`** *`string`* - path or content of a PEM-encoded client key file
+* **`insecure`** *`bool`* - if set, the token issuer will skip SSL/TLS verification
+
+<br>
+
+**`is_ssl_enabled`** *`bool`* *`default=false`* 
+
+If set, the plugin will use SSL/TLS connections method.
+
+<br>
+
+**`ssl_skip_verify`** *`bool`* *`default=false`* 
+
+If set, the plugin will skip SSL/TLS verification.
+
+<br>
+
+**`client_cert`** *`string`* 
+
+Path or content of a PEM-encoded client certificate file.
+
+<br>
+
+**`client_key`** *`string`* 
+
+> Path or content of a PEM-encoded client key file.
+
+<br>
+
+**`ca_cert`** *`string`* 
+
+Path or content of a PEM-encoded CA file.
+
+<br>
+
+
+<br>*Generated using [__insane-doc__](https://github.com/vitkovskii/insane-doc)*

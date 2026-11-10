@@ -1,0 +1,10 @@
+pipelines:
+  kafka_file:
+    input:
+      type: kafka
+      offset: oldest
+      meta:
+        partition: "partition_{{ .partition }}"
+        topic: "{{ .topic }}"
+    output:
+      type: file

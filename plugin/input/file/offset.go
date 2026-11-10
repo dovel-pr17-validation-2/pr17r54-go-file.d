@@ -1,0 +1,319 @@
+package file
+
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+
+	"sync/atomic"
+
+	"github.com/ozontech/file.d/logger"
+	"github.com/ozontech/file.d/pipeline"
+	"github.com/ozontech/file.d/xtime"
+)
+
+type offsetDB struct {
+	curOffsetsFile string
+	tmpOffsetsFile string
+	savesTotal     *atomic.Int64
+	jobsSnapshot   []*Job
+	buf            []byte
+	mu             *sync.Mutex
+	reloadCh       chan bool
+}
+
+type inodeOffsets struct {
+	filename          string
+	sourceID          pipeline.SourceID
+	streams           map[pipeline.StreamName]int64
+	lastReadTimestamp int64
+}
+
+type (
+	streamsOffsets map[pipeline.StreamName]int64
+	fpOffsets      map[pipeline.SourceID]*inodeOffsets
+)
+
+func newOffsetDB(curOffsetsFile string, tmpOffsetsFile string) *offsetDB {
+	return &offsetDB{
+		curOffsetsFile: curOffsetsFile,
+		tmpOffsetsFile: tmpOffsetsFile,
+		mu:             &sync.Mutex{},
+		savesTotal:     &atomic.Int64{},
+		buf:            make([]byte, 0, 65536),
+		jobsSnapshot:   make([]*Job, 0),
+		reloadCh:       make(chan bool),
+	}
+}
+
+func (o *offsetDB) load() (fpOffsets, error) {
+	logger.Infof("loading offsets: %s", o.curOffsetsFile)
+
+	info, err := os.Stat(o.curOffsetsFile)
+	if os.IsNotExist(err) {
+		return make(fpOffsets), nil
+	}
+
+	if info.IsDir() {
+		logger.Fatalf("can't load offsets, file %s is dir")
+	}
+
+	content, err := os.ReadFile(o.curOffsetsFile)
+	if err != nil {
+		logger.Panicf("can't read offset file: %s", err.Error())
+	}
+
+	offsets, err := o.parse(string(content))
+	if err != nil {
+		return make(fpOffsets), fmt.Errorf("can't load offsets file: %w", err)
+	}
+
+	return offsets, nil
+}
+
+func (o *offsetDB) parse(content string) (fpOffsets, error) {
+	offsets := make(fpOffsets)
+	for content != "" {
+		one, err := o.parseOne(content, offsets)
+		if err != nil {
+			return make(fpOffsets), fmt.Errorf("can't parseOne: %w", err)
+		}
+		content = one
+	}
+
+	return offsets, nil
+}
+
+func (o *offsetDB) parseOne(content string, offsets fpOffsets) (string, error) {
+	filename := ""
+	inodeStr := ""
+	sourceIDStr := ""
+	lastReadTimestampStr := ""
+	var err error
+
+	filename, content, err = o.parseLine(content, "- file: ")
+	if err != nil {
+		return "", fmt.Errorf("can't parse file: %w", err)
+	}
+	inodeStr, content, err = o.parseLine(content, "  inode: ")
+	if err != nil {
+		return "", fmt.Errorf("can't parse inode: %w", err)
+	}
+	sourceIDStr, content, err = o.parseLine(content, "  source_id: ")
+	if err != nil {
+		return "", fmt.Errorf("can't parse source_id: %w", err)
+	}
+
+	lastReadTimestampStr, content, err = o.parseOptionalLine(content, "  last_read_timestamp: ")
+	if err != nil {
+		return "", fmt.Errorf("can't parse last_read_timestamp: %w", err)
+	}
+
+	sysInode, err := strconv.ParseUint(inodeStr, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("wrong offsets format, can't parse inode: %s: %w", inodeStr, err)
+	}
+	inode := inodeID(sysInode)
+
+	fpVal, err := strconv.ParseUint(sourceIDStr, 10, 64)
+	if err != nil {
+		return "", fmt.Errorf("wrong offsets format, can't parse source id: %s: %w", sourceIDStr, err)
+	}
+	fp := pipeline.SourceID(fpVal)
+
+	_, has := offsets[fp]
+	if has {
+		return "", fmt.Errorf("wrong offsets format, duplicate inode %d", inode)
+	}
+
+	var lastReadTimestampVal int64
+	if lastReadTimestampStr != "" {
+		lastReadTimestampVal, err = strconv.ParseInt(lastReadTimestampStr, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid timestamp format %q: %w", lastReadTimestampStr, err)
+		}
+	} else {
+		lastReadTimestampVal = xtime.GetInaccurateUnixNano()
+	}
+
+	offsets[fp] = &inodeOffsets{
+		streams:           make(map[pipeline.StreamName]int64),
+		filename:          filename,
+		sourceID:          fp,
+		lastReadTimestamp: lastReadTimestampVal,
+	}
+
+	return o.parseStreams(content, offsets[fp].streams)
+}
+
+func (o *offsetDB) parseStreams(content string, streams streamsOffsets) (string, error) {
+	_, content, err := o.parseLine(content, "  streams:")
+	if err != nil {
+		return "", fmt.Errorf("can''t parse line: %w", err)
+	}
+
+	for content != "" && content[0] != '-' {
+		linePos := strings.IndexByte(content, '\n')
+		if linePos < 0 {
+			return "", fmt.Errorf("wrong offsets format, no new line %s", content)
+		}
+		line := content[0:linePos]
+		if linePos < 5 || line[0:4] != "    " {
+			return "", fmt.Errorf("wrong offsets format, no leading whitespaces %q", line)
+		}
+		content = content[linePos+1:]
+
+		pos := strings.LastIndexByte(line, ':')
+		if pos < 0 {
+			return "", fmt.Errorf("wrong offsets format, no separator %q", line)
+		}
+		stream := pipeline.StreamName(line[4:pos])
+		if len(stream) == 0 {
+			return "", fmt.Errorf("wrong offsets format, empty stream, %s", content)
+		}
+
+		_, has := streams[stream]
+		if has {
+			return "", fmt.Errorf("wrong offsets format, duplicate stream %q", stream)
+		}
+
+		offsetStr := line[pos+2:]
+		offset, err := strconv.ParseInt(offsetStr, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("wrong offsets format, can't parse offset: %q: %w", offsetStr, err)
+		}
+
+		streams[stream] = offset
+	}
+
+	return content, nil
+}
+
+func (o *offsetDB) parseLine(content string, prefix string) (string, string, error) {
+	if content == "" {
+		return "", "", fmt.Errorf("unexpected end of content while looking for %q", prefix)
+	}
+
+	linePos := strings.IndexByte(content, '\n')
+	if linePos < 0 {
+		return "", "", fmt.Errorf("no newline found in content")
+	}
+
+	line := content[:linePos]
+	remaining := content[linePos+1:]
+
+	if len(line) < len(prefix) || line[:len(prefix)] != prefix {
+		return "", "", fmt.Errorf("expected prefix %q, got %q", prefix, safeSubstring(line, len(prefix)))
+	}
+
+	return line[len(prefix):], remaining, nil
+}
+
+func (o *offsetDB) parseOptionalLine(content string, prefix string) (string, string, error) {
+	if content == "" {
+		return "", content, nil // No content, return empty value
+	}
+
+	if len(content) >= len(prefix) && content[:len(prefix)] == prefix {
+		return o.parseLine(content, prefix)
+	}
+
+	return "", content, nil
+}
+
+func safeSubstring(s string, length int) string {
+	if len(s) < length {
+		return s
+	}
+	return s[:length]
+}
+
+func (o *offsetDB) save(jobs map[pipeline.SourceID]*Job, mu *sync.RWMutex) {
+	o.savesTotal.Add(1)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// snapshot jobs to avoid long locks
+	snapshot := o.snapshotJobs(mu, jobs)
+
+	tmpWithRandom := append(make([]byte, 0), o.tmpOffsetsFile...)
+	tmpWithRandom = append(tmpWithRandom, '.')
+	tmpWithRandom = strconv.AppendUint(tmpWithRandom, rand.Uint64(), 8)
+
+	file, err := os.OpenFile(string(tmpWithRandom), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		logger.Errorf("can't open temp offsets file %s, %s", o.tmpOffsetsFile, err.Error())
+		return
+	}
+	defer func() {
+		err := file.Close()
+		if err != nil {
+			logger.Errorf("can't close offsets file: %s, %s", o.tmpOffsetsFile, err.Error())
+		}
+	}()
+
+	o.buf = o.buf[:0]
+	for _, job := range snapshot {
+		job.mu.Lock()
+		if len(job.offsets) == 0 {
+			job.mu.Unlock()
+			continue
+		}
+
+		o.buf = append(o.buf, "- file: "...)
+		o.buf = append(o.buf, job.filename...)
+		o.buf = append(o.buf, '\n')
+
+		o.buf = append(o.buf, "  inode: "...)
+		o.buf = strconv.AppendUint(o.buf, uint64(job.inode), 10)
+		o.buf = append(o.buf, '\n')
+
+		o.buf = append(o.buf, "  source_id: "...)
+		o.buf = strconv.AppendUint(o.buf, uint64(job.sourceID), 10)
+		o.buf = append(o.buf, '\n')
+
+		o.buf = append(o.buf, "  last_read_timestamp: "...)
+		o.buf = strconv.AppendInt(o.buf, job.eofReadInfo.getUnixNanoTimestamp(), 10)
+		o.buf = append(o.buf, '\n')
+
+		o.buf = append(o.buf, "  streams:\n"...)
+		for _, strOff := range job.offsets {
+			o.buf = append(o.buf, "    "...)
+			o.buf = append(o.buf, string(strOff.Stream)...)
+			o.buf = append(o.buf, ": "...)
+			o.buf = strconv.AppendUint(o.buf, uint64(strOff.Offset), 10)
+			o.buf = append(o.buf, '\n')
+		}
+		job.mu.Unlock()
+	}
+
+	_, err = file.Write(o.buf)
+	if err != nil {
+		logger.Errorf("can't write offsets file %s, %s", o.tmpOffsetsFile, err.Error())
+	}
+
+	err = file.Sync()
+	if err != nil {
+		logger.Errorf("can't sync offsets file %s, %s", o.tmpOffsetsFile, err.Error())
+	}
+
+	err = os.Rename(string(tmpWithRandom), o.curOffsetsFile)
+	if err != nil {
+		logger.Errorf("failed renaming temporary offsets file to current: %s", err.Error())
+	}
+}
+
+func (o *offsetDB) snapshotJobs(mu *sync.RWMutex, jobs map[pipeline.SourceID]*Job) []*Job {
+	o.jobsSnapshot = o.jobsSnapshot[:0]
+	mu.RLock()
+	for _, job := range jobs {
+		o.jobsSnapshot = append(o.jobsSnapshot, job)
+	}
+	mu.RUnlock()
+
+	return o.jobsSnapshot
+}

@@ -1,0 +1,379 @@
+package fd
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/ozontech/file.d/cfg"
+	"github.com/ozontech/file.d/logger"
+	"github.com/ozontech/file.d/pipeline"
+	"github.com/ozontech/file.d/pipeline/antispam"
+	"github.com/ozontech/file.d/pipeline/doif"
+)
+
+func extractPipelineParams(settings *simplejson.Json) *pipeline.Settings {
+	capacity := pipeline.DefaultCapacity
+	sourceNameMetaField := pipeline.DefaultSourceNameMetaField
+	avgInputEventSize := pipeline.DefaultAvgInputEventSize
+	maxInputEventSize := pipeline.DefaultMaxInputEventSize
+	cutOffEventByLimit := pipeline.DefaultCutOffEventByLimit
+	cutOffEventByLimitField := pipeline.DefaultCutOffEventByLimitField
+	streamField := pipeline.DefaultStreamField
+	maintenanceInterval := pipeline.DefaultMaintenanceInterval
+	decoder := pipeline.DefaultDecoder
+	decoderParams := make(map[string]any)
+	isStrict := pipeline.DefaultIsStrict
+	eventTimeout := pipeline.DefaultEventTimeout
+	metaCacheSize := pipeline.DefaultMetaCacheSize
+	pool := ""
+
+	antispamThreshold := pipeline.DefaultAntispamThreshold
+	antispamMaintenanceInterval := pipeline.DefaultMaintenanceInterval
+	var antispamExceptions antispam.Exceptions
+	var antispamRules antispam.Rules
+	var antispamSampler *antispam.Sampler
+
+	metricHoldDuration := pipeline.DefaultMetricHoldDuration
+	metricMaxLabelValueLength := pipeline.DefaultMetricMaxLabelValueLength
+
+	if settings != nil {
+		val := settings.Get("capacity").MustInt()
+		if val != 0 {
+			capacity = val
+		}
+
+		val = settings.Get("meta_cache_size").MustInt()
+		if val != 0 {
+			metaCacheSize = val
+		}
+
+		val = settings.Get("avg_log_size").MustInt()
+		if val != 0 {
+			avgInputEventSize = val
+		}
+
+		val = settings.Get("max_event_size").MustInt()
+		if val != 0 {
+			maxInputEventSize = val
+		}
+
+		cutOffEventByLimit = settings.Get("cut_off_event_by_limit").MustBool()
+		cutOffEventByLimitField = settings.Get("cut_off_event_by_limit_field").MustString()
+
+		str := settings.Get("decoder").MustString()
+		if str != "" {
+			decoder = str
+		}
+
+		decoderParams = settings.Get("decoder_params").MustMap()
+
+		str = settings.Get("stream_field").MustString()
+		if str != "" {
+			streamField = str
+		}
+
+		str = settings.Get("maintenance_interval").MustString()
+		if str != "" {
+			i, err := time.ParseDuration(str)
+			if err != nil {
+				logger.Fatalf("can't parse pipeline maintenance interval: %s", err.Error())
+			}
+			maintenanceInterval = i
+		}
+
+		str = settings.Get("event_timeout").MustString()
+		if str != "" {
+			i, err := time.ParseDuration(str)
+			if err != nil {
+				logger.Fatalf("can't parse pipeline event timeout: %s", err.Error())
+			}
+			eventTimeout = i
+		}
+
+		var err error
+		antispamExceptions, err = extractAntispamExceptions(settings)
+		if err != nil {
+			logger.Fatalf("extract exceptions: %s", err)
+		}
+		antispamExceptions.Prepare()
+
+		antispamSettings := settings.Get("antispam")
+		str = antispamSettings.Get("maintenance_interval").MustString()
+		if str != "" {
+			i, err := time.ParseDuration(str)
+			if err != nil {
+				logger.Fatalf("can't parse antispam maintenance interval: %s", err.Error())
+			}
+			antispamMaintenanceInterval = i
+		}
+
+		antispamThreshold = antispamSettings.Get("threshold").MustInt(pipeline.DefaultAntispamThreshold)
+		if mp, _ := antispamSettings.Map(); mp == nil {
+			antispamThreshold = settings.Get("antispam_threshold").MustInt(pipeline.DefaultAntispamThreshold)
+		}
+		if antispamThreshold < pipeline.DefaultAntispamThreshold {
+			logger.Warn("invalid antispam_threshold value, antispam disabled")
+			antispamThreshold = pipeline.DefaultAntispamThreshold
+		}
+		if antispamThreshold != pipeline.DefaultAntispamThreshold {
+			antispamThreshold *= int(antispamMaintenanceInterval / time.Second)
+		}
+
+		antispamRules, err = extractAntispamRules(antispamSettings, antispamMaintenanceInterval)
+		if err != nil {
+			logger.Fatalf("extract antispam rules: %s", err)
+		}
+
+		antispamSampler, err = extractAntispamSampler(antispamSettings)
+		if err != nil {
+			logger.Fatalf("extract antispam sampler: %s", err)
+		}
+
+		sourceNameMetaField = settings.Get("source_name_meta_field").MustString()
+		isStrict = settings.Get("is_strict").MustBool()
+
+		if str := settings.Get("pool").MustString(); str != "" {
+			pool = str
+		}
+
+		metrics := settings.Get("metrics")
+		str = metrics.Get("hold_duration").MustString()
+		if str == "" {
+			str = settings.Get("metric_hold_duration").MustString()
+		}
+		if str != "" {
+			i, err := time.ParseDuration(str)
+			if err != nil {
+				logger.Fatalf("can't parse pipeline metric hold duration: %s", err.Error())
+			}
+			metricHoldDuration = i
+		}
+
+		metricMaxLabelValueLength = metrics.Get("max_label_value_length").MustInt()
+		if metricMaxLabelValueLength < 0 {
+			logger.Warn("negative max_label_value_length value, metric label truncation is disabled")
+			metricMaxLabelValueLength = 0
+		}
+	}
+
+	return &pipeline.Settings{
+		Decoder:                 decoder,
+		DecoderParams:           decoderParams,
+		Capacity:                capacity,
+		MetaCacheSize:           metaCacheSize,
+		AvgEventSize:            avgInputEventSize,
+		MaxEventSize:            maxInputEventSize,
+		CutOffEventByLimit:      cutOffEventByLimit,
+		CutOffEventByLimitField: cutOffEventByLimitField,
+		Antispam: pipeline.AntispamSettings{
+			Threshold:           antispamThreshold,
+			Rules:               antispamRules,
+			Exceptions:          antispamExceptions,
+			MaintenanceInterval: antispamMaintenanceInterval,
+			Sampler:             antispamSampler,
+		},
+		SourceNameMetaField: sourceNameMetaField,
+		MaintenanceInterval: maintenanceInterval,
+		EventTimeout:        eventTimeout,
+		StreamField:         streamField,
+		IsStrict:            isStrict,
+		Pool:                pipeline.PoolType(pool),
+		Metric: &pipeline.MetricSettings{
+			HoldDuration:        metricHoldDuration,
+			MaxLabelValueLength: metricMaxLabelValueLength,
+		},
+	}
+}
+
+func extractAntispamExceptions(settings *simplejson.Json) (antispam.Exceptions, error) {
+	raw, err := settings.Get("antispam_exceptions").MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+
+	var exceptions antispam.Exceptions
+	if err := dec.Decode(&exceptions); err != nil {
+		return nil, err
+	}
+
+	return exceptions, nil
+}
+
+func extractAntispamRules(settings *simplejson.Json, antispamMaintenanceInterval time.Duration) (antispam.Rules, error) {
+	rulesJSON := settings.Get("rules")
+	rulesRaw := rulesJSON.MustArray()
+	if len(rulesRaw) == 0 {
+		return nil, nil
+	}
+
+	rules := make(antispam.Rules, 0, len(rulesRaw))
+	for i := range rulesRaw {
+		ruleJSON := rulesJSON.GetIndex(i)
+
+		name := ruleJSON.Get("name").MustString()
+		if name == "" {
+			return nil, fmt.Errorf("name must be set")
+		}
+
+		threshold := ruleJSON.Get("threshold").MustInt()
+		if threshold < pipeline.DefaultAntispamThreshold {
+			logger.Warnf("invalid threshold value, antispam disabled for rule #%d", i)
+			threshold = pipeline.DefaultAntispamThreshold
+		}
+		if threshold != pipeline.DefaultAntispamThreshold {
+			threshold *= int(antispamMaintenanceInterval / time.Second)
+		}
+
+		doIfChecker, err := extractDoIfChecker(ruleJSON.Get("do_if"))
+		if err != nil {
+			return nil, err
+		}
+
+		if doIfChecker == nil {
+			return nil, fmt.Errorf("missing do_if section, rule #%d", i)
+		}
+
+		rules = append(rules, antispam.Rule{
+			Name:        name,
+			Threshold:   threshold,
+			DoIfChecker: doIfChecker,
+		})
+	}
+
+	return rules, nil
+}
+
+func extractAntispamSampler(settings *simplejson.Json) (*antispam.Sampler, error) {
+	sampleJSON, ok := settings.CheckGet("sampler")
+	if !ok {
+		return nil, nil
+	}
+
+	intervalStr := sampleJSON.Get("interval").MustString()
+	if intervalStr == "" {
+		return nil, fmt.Errorf("interval is required")
+	}
+	interval, err := time.ParseDuration(intervalStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse interval: %w", err)
+	}
+	if interval <= 0 {
+		return nil, fmt.Errorf("interval must be > 0, got %s", interval)
+	}
+
+	first := sampleJSON.Get("first").MustInt64()
+	if first < 0 {
+		return nil, fmt.Errorf("first must be >= 0, got %d", first)
+	}
+
+	thereafter := sampleJSON.Get("thereafter").MustInt64()
+	if thereafter < 0 {
+		return nil, fmt.Errorf("thereafter must be >= 0, got %d", thereafter)
+	}
+	if first == 0 && thereafter == 0 {
+		return nil, fmt.Errorf("at least one of first/thereafter must be > 0")
+	}
+
+	return &antispam.Sampler{
+		Interval:     interval,
+		First:        first,
+		Thereafter:   thereafter,
+		MarkerField:  sampleJSON.Get("marker_field").MustString(),
+		MetricName:   sampleJSON.Get("metric_name").MustString(),
+		MetricLabels: sampleJSON.Get("metric_labels").MustStringArray(),
+	}, nil
+}
+
+func extractMatchMode(actionJSON *simplejson.Json) pipeline.MatchMode {
+	mm := actionJSON.Get("match_mode").MustString()
+	return pipeline.MatchModeFromString(mm)
+}
+
+func extractMatchInvert(actionJSON *simplejson.Json) bool {
+	invertMatchMode := actionJSON.Get("match_invert").MustBool()
+	return invertMatchMode
+}
+
+func extractConditions(condJSON *simplejson.Json) (pipeline.MatchConditions, error) {
+	conditions := make(pipeline.MatchConditions, 0)
+	for field := range condJSON.MustMap() {
+		obj := condJSON.Get(field).Interface()
+
+		condition := pipeline.MatchCondition{
+			Field: cfg.ParseFieldSelector(field),
+		}
+
+		if value, ok := obj.(string); ok {
+			if value != "" && value[0] == '/' {
+				r, err := cfg.CompileRegex(value)
+				if err != nil {
+					return nil, fmt.Errorf("can't compile regexp %s: %w", value, err)
+				}
+				condition.Regexp = r
+			} else {
+				condition.Values = []string{value}
+			}
+
+			conditions = append(conditions, condition)
+			continue
+		}
+
+		if jsonValues, ok := obj.([]any); ok {
+			condition.Values = make([]string, 0, len(jsonValues))
+
+			for _, jsonValue := range jsonValues {
+				val, ok := jsonValue.(string)
+				if !ok {
+					return nil, fmt.Errorf("can't parse %v as string", jsonValue)
+				}
+				condition.Values = append(condition.Values, val)
+			}
+
+			conditions = append(conditions, condition)
+			continue
+		}
+	}
+
+	return conditions, nil
+}
+
+func extractMetrics(actionJSON *simplejson.Json) (string, []string, bool) {
+	metricName := actionJSON.Get("metric_name").MustString()
+	metricLabels := actionJSON.Get("metric_labels").MustStringArray()
+	if metricLabels == nil {
+		metricLabels = []string{}
+	}
+	skipStatus := actionJSON.Get("metric_skip_status").MustBool()
+	return metricName, metricLabels, skipStatus
+}
+
+func extractDoIfChecker(actionJSON *simplejson.Json) (*doif.Checker, error) {
+	m := actionJSON.MustMap()
+	if m == nil {
+		return nil, nil
+	}
+
+	return doif.NewFromMap(m)
+}
+
+func makeActionJSON(actionJSON *simplejson.Json) []byte {
+	actionJSON.Del("type")
+	actionJSON.Del("match_fields")
+	actionJSON.Del("match_mode")
+	actionJSON.Del("metric_name")
+	actionJSON.Del("metric_labels")
+	actionJSON.Del("metric_skip_status")
+	actionJSON.Del("match_invert")
+	actionJSON.Del("do_if")
+	configJson, err := actionJSON.Encode()
+	if err != nil {
+		logger.Panicf("can't create action json")
+	}
+	return configJson
+}

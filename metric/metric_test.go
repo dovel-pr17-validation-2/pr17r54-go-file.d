@@ -1,0 +1,151 @@
+package metric
+
+import (
+	"strings"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/ozontech/file.d/xtime"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLabelExpiration(t *testing.T) {
+	r := require.New(t)
+
+	ctl := NewCtl("test", prometheus.NewRegistry(), time.Minute, 0)
+	c := ctl.RegisterCounterVec("errors", "", "level")
+
+	now := time.Now().UnixNano()
+	xtime.SetNowTime(now)
+
+	c.WithLabelValues("error").Inc()
+	c.WithLabelValues("warn").Inc()
+	c.WithLabelValues("info").Inc()
+
+	r.Equal(3, len(c.store.metricsByHash))
+	c.DeleteOldMetrics(time.Minute)
+	r.Equal(3, len(c.store.metricsByHash))
+
+	// update usage of the metric with "info" label
+	{
+		newNow := now + (time.Second * 30).Nanoseconds()
+		xtime.SetNowTime(newNow)
+		c.WithLabelValues("info").Inc()
+	}
+
+	// set new time to expire "warn" and "error" metrics
+	xtime.SetNowTime(now + time.Minute.Nanoseconds() + time.Nanosecond.Nanoseconds())
+
+	c.DeleteOldMetrics(time.Minute)
+
+	hash := computeStringsHash([]string{"info"})
+	r.Equal(1, len(c.store.metricsByHash))
+
+	infoMetric := c.store.metricsByHash[hash][0]
+	r.Equal([]string{"info"}, infoMetric.labels)
+}
+
+func TestUnsafeStringInMetric(t *testing.T) {
+	r := require.New(t)
+
+	bytes := []byte("hello world")
+	unsafeString := unsafe.String(unsafe.SliceData(bytes), len(bytes))
+
+	store := newHeldMetricsStore(0,
+		func(hm *heldMetric[prometheus.Counter]) *Counter {
+			return &Counter{heldMetric: hm}
+		},
+	)
+
+	labels := []string{unsafeString}
+	m := store.GetOrCreate([]string{unsafeString}, func(s ...string) prometheus.Counter {
+		return prometheus.NewCounter(prometheus.CounterOpts{})
+	})
+
+	bytes[0] = '1'
+	labels[0] = "new"
+
+	r.Equal([]string{"hello world"}, m.labels)
+}
+
+func TestLabelTruncation(t *testing.T) {
+	r := require.New(t)
+
+	maxLabelValueLength := 10
+	label := "some_long_label_value"
+	ctl := NewCtl("test", prometheus.NewRegistry(), time.Minute, maxLabelValueLength)
+	c := ctl.RegisterCounterVec("errors", "", "level")
+
+	c.WithLabelValues(label).Inc()
+	r.Equal(float64(1), c.WithLabelValues("some_long_").ToFloat64())
+
+	c.DeleteLabelValues(label)
+	r.Equal(float64(0), c.WithLabelValues("some_long_").ToFloat64())
+}
+
+var holderBenchCases = []struct {
+	Labels      []string
+	LabelValues [][]string
+}{
+	{
+		Labels: []string{"l1"},
+		LabelValues: [][]string{
+			{"test1"},
+			{"test2"},
+			{"test3"},
+		},
+	},
+	{
+		Labels: []string{"l1", "l2"},
+		LabelValues: [][]string{
+			{"first1", "second1"},
+			{"first2", "second2"},
+			{"first3", "second3"},
+		},
+	},
+	{
+		Labels: []string{"l1", "l2", "l3"},
+		LabelValues: [][]string{
+			{"first1", "second1", "third1"},
+			{"first2", "second2", "third2"},
+			{"first3", "second3", "third3"},
+		},
+	},
+}
+
+func BenchmarkMetricHolder(b *testing.B) {
+	for _, benchCase := range holderBenchCases {
+		ctl := NewCtl("test", prometheus.NewRegistry(), time.Minute, 0)
+
+		counter := ctl.RegisterCounterVec("test_name", "", benchCase.Labels...)
+		ctl.AddToHolder(counter)
+
+		name := strings.Join(benchCase.Labels, "_")
+
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for _, labels := range benchCase.LabelValues {
+					counter.WithLabelValues(labels...).Inc()
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPromVec(b *testing.B) {
+	for _, benchCase := range holderBenchCases {
+		ctl := NewCtl("test", prometheus.NewRegistry(), time.Minute, 0)
+		counter := ctl.RegisterCounterVec("test_name", "", benchCase.Labels...)
+		name := strings.Join(benchCase.Labels, "_")
+
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for _, labels := range benchCase.LabelValues {
+					counter.WithLabelValues(labels...).Inc()
+				}
+			}
+		})
+	}
+}
